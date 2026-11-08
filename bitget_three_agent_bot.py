@@ -16,7 +16,8 @@ from datetime import datetime, timezone
 from anthropic import Anthropic
 import arena_feed as arena
 
-PAPER = True
+PAPER = os.getenv("PAPER", "true").strip().lower() != "false"      # real orders ONLY when PAPER=false
+NEW_ENTRIES = os.getenv("NEW_ENTRIES", "on").strip().lower() != "off"   # "off" = no new buys, exits still managed
 BUYER_MODEL = os.getenv("BUYER_MODEL", "claude-haiku-5-5")
 SELLER_MODEL = os.getenv("SELLER_MODEL", "claude-haiku-5-5")
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "claude-sonnet-5-5")
@@ -28,7 +29,7 @@ DEBATES_PER_DAY = 20        # max Buyer/Seller debates per day (this also caps J
 EDGE_SAFETY = 0.3           # extra % margin on top of break-even
 UNIVERSE = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "DOGE/USDT",
             "ADA/USDT", "LINK/USDT", "AVAX/USDT", "TON/USDT", "SUI/USDT", "LTC/USDT"]
-START_USDT = 600.0
+START_USDT = float(os.getenv("START_USDT", "600"))   # capital the bot may use (live: capped to your real USDT balance)
 MAX_POS = 3
 TRADE_PCT = 0.20            # 20% of equity per trade
 MIN_CONF = 70               # buyer confidence needed to even reach the judge
@@ -62,6 +63,46 @@ if os.path.exists(LEDGER_FILE):
 
 def save_ledger():
     json.dump(LEDGER, open(LEDGER_FILE, "w"))
+
+
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+
+
+def save_state():
+    """Open positions and cash survive restarts, so a live position never loses its stop-loss."""
+    json.dump({"paper": PAPER, "cash": cash, "pos": pos, "start": START_USDT, "day_start_eq": day_start_eq},
+              open(STATE_FILE, "w"))
+
+
+def switch_mode_if_needed():
+    """Paper and live results must never mix: switching mode starts a clean ledger and arena history."""
+    if LEDGER.get("paper") is not None and LEDGER["paper"] != PAPER:
+        print("Mode changed, starting fresh ledger and arena history for", "PAPER" if PAPER else "LIVE")
+        for k in ("api_total", "api_today", "fees_total", "trades_total", "debates_today"):
+            LEDGER[k] = 0
+        arena.reset()
+    LEDGER["paper"] = PAPER
+    save_ledger()
+
+
+def init_state():
+    global cash, pos, START_USDT, day_start_eq
+    loaded = False
+    try:
+        d = json.load(open(STATE_FILE))
+        if d.get("paper") == PAPER:
+            cash, pos, START_USDT = d["cash"], d["pos"], d.get("start", START_USDT)
+            day_start_eq = d.get("day_start_eq", START_USDT)
+            loaded = True
+            print("Restored state: cash", round(cash, 2), "| open positions:", list(pos))
+    except Exception:
+        pass
+    if not loaded and not PAPER:
+        free = float(ex.fetch_balance()["USDT"]["free"])
+        START_USDT = cash = min(START_USDT, free)
+        day_start_eq = START_USDT
+        print(f"LIVE: the bot will trade with {cash:.2f} USDT (your Bitget USDT balance is {free:.2f})")
+    save_state()
 
 
 def roll_day():
@@ -232,50 +273,88 @@ def equity():
     return cash + sum(p["qty"] * ex.fetch_ticker(s)["last"] for s, p in pos.items())
 
 
+def held_qty(sym, qty):
+    """Spot fees are taken in the coin you buy, so the real balance can sit slightly below the filled amount."""
+    try:
+        free = float(ex.fetch_balance().get(sym.split("/")[0], {}).get("free") or 0)
+        if 0 < free < qty:
+            return float(ex.amount_to_precision(sym, free))
+    except Exception as e:
+        print("balance check failed:", repr(e))
+    return qty
+
+
 def buy(sym, size, sl, tp, reason):
     global cash
     tk = ex.fetch_ticker(sym)
     if (tk["ask"] - tk["bid"]) / tk["last"] > MAX_SPREAD:
         print("spread too wide", sym)
         return
+    if not PAPER:                                       # never spend more than the account really has
+        size = min(size, float(ex.fetch_balance()["USDT"]["free"]) * 0.99)
+        if size < 5:
+            print("not enough free USDT to trade")
+            return
     qty, price = float(ex.amount_to_precision(sym, size / tk["ask"])), tk["ask"]
     if not PAPER:
         o = ex.create_limit_buy_order(sym, qty, price)
         time.sleep(5)
         o = ex.fetch_order(o["id"], sym)
         if o["status"] != "closed":
-            ex.cancel_order(o["id"], sym)
+            try:
+                ex.cancel_order(o["id"], sym)
+            except Exception as e:
+                print("cancel:", repr(e))
+            time.sleep(1)
+            o = ex.fetch_order(o["id"], sym)            # final filled amount after the cancel
         qty = float(o.get("filled") or 0)
         if qty <= 0:
             return
         price = o.get("average") or price
+        qty = held_qty(sym, qty)
     cash -= qty * price * (1 + FEE)
     LEDGER["fees_total"] += qty * price * FEE
     save_ledger()
     pos[sym] = {"qty": qty, "entry": price, "t": time.time(), "sl": sl, "tp": tp}
+    save_state()
     log([datetime.now().isoformat(), sym, "BUY", price, qty, "", reason, round(cash, 2)])
     print("BUY", sym, price, "|", reason)
 
 
 def sell(sym, reason):
     global cash
-    p = pos.pop(sym)
+    p = pos[sym]                                        # stays tracked until the sale really succeeds
     tk = ex.fetch_ticker(sym)
     price = tk["bid"]
     if not PAPER:
-        o = ex.create_limit_sell_order(sym, p["qty"], price)
-        time.sleep(5)
-        o = ex.fetch_order(o["id"], sym)
-        if o["status"] != "closed":              # exits must succeed
-            ex.cancel_order(o["id"], sym)
-            o = ex.create_market_sell_order(sym, p["qty"])
-        price = o.get("average") or price
+        try:
+            qty = held_qty(sym, p["qty"])
+            o = ex.create_limit_sell_order(sym, qty, price)
+            time.sleep(5)
+            o = ex.fetch_order(o["id"], sym)
+            if o["status"] != "closed":                 # exits must succeed
+                try:
+                    ex.cancel_order(o["id"], sym)
+                except Exception as e:
+                    print("cancel:", repr(e))
+                time.sleep(1)
+                o = ex.fetch_order(o["id"], sym)
+                left = qty - float(o.get("filled") or 0)
+                if left > 0:
+                    left = float(ex.amount_to_precision(sym, held_qty(sym, left)))
+                    o = ex.create_market_sell_order(sym, left)
+            price = o.get("average") or price
+        except Exception as e:
+            print("SELL FAILED, will retry next minute:", sym, repr(e))
+            return
+    pos.pop(sym)
     proceeds = p["qty"] * price * (1 - FEE)
     pnl = proceeds - p["qty"] * p["entry"] * (1 + FEE)
     cash += proceeds
     LEDGER["fees_total"] += p["qty"] * price * FEE
     LEDGER["trades_total"] += 1
     save_ledger()
+    save_state()
     log([datetime.now().isoformat(), sym, "SELL", price, p["qty"], round(pnl, 3), reason, round(cash, 2)])
     arena.close_trade(sym, pnl, pnl / (p["qty"] * p["entry"]) * 100, reason)
     print("SELL", sym, "pnl", round(pnl, 3), "|", reason)
@@ -299,6 +378,7 @@ def halted():
     today = datetime.now(timezone.utc).date()
     if today != day:
         day, day_start_eq = today, equity()
+        save_state()
     return equity() <= day_start_eq * (1 - DAILY_LOSS)
 
 
@@ -326,7 +406,7 @@ def cycle():
     ctx = {"market": snap, "regime": reg, "news": nws, "economics": eco,
            "portfolio": {"cash": round(cash, 2), "equity": round(eq, 2), "positions": holdings}}
 
-    stop_buys = halted() or len(pos) >= MAX_POS
+    stop_buys = halted() or len(pos) >= MAX_POS or not NEW_ENTRIES
     min_conf = MIN_CONF + (0 if eco["costs_recovered"] else 5)     # pickier while costs are unrecovered
     buys = [] if stop_buys else llm_json(BUYER_SYS, ctx, BUYER_MODEL).get("proposals", [])
     buys = [b for b in buys if b.get("symbol") in UNIVERSE and b.get("symbol") not in pos
@@ -399,7 +479,11 @@ def cycle():
 
 
 if __name__ == "__main__":
-    print("PAPER mode" if PAPER else "LIVE mode", "- 3-agent bot starting")
+    print("PAPER mode" if PAPER else "LIVE mode (REAL MONEY)", "- 3-agent bot starting")
+    if not PAPER and not (os.getenv("BITGET_KEY") and os.getenv("BITGET_SECRET") and os.getenv("BITGET_PASSPHRASE")):
+        raise SystemExit("LIVE mode needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
+    switch_mode_if_needed()
+    init_state()
     last_cycle = 0.0
     try:                                               # heartbeat: proves the bot can reach your website repo
         arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
