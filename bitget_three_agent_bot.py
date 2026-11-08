@@ -421,6 +421,73 @@ def selftest():
         print("SELFTEST FAILED:", repr(e))
 
 
+def judgetest():
+    """Runs the REAL agents (Buyer reply, Seller challenge, Judge) on three test ideas. No orders are placed.
+    A: a pumped coin (should be rejected)  B: take-profit below break-even (should be rejected)
+    C: an oversold bounce (a fair idea, the Judge may go either way). Enable with JUDGETEST=yes."""
+    marker = os.path.join(DATA_DIR, "judgetest_done")
+    if os.path.exists(marker) and os.getenv("JUDGETEST", "").lower() != "force":
+        print("JUDGETEST already done earlier, remove the JUDGETEST variable in Railway")
+        return
+    print("JUDGETEST: running the real Buyer, Seller and Judge on test ideas. No orders will be placed.")
+    snap, nws = snapshot(), news()
+    reg, eq = regime(snap), equity()
+    eco = economics(eq)
+    base = {"regime": reg, "news": nws, "economics": eco,
+            "portfolio": {"cash": round(cash, 2), "equity": round(eq, 2), "positions": []}}
+
+    def market_with(sym, **vals):
+        rows = [dict(x) for x in snap]
+        row = next((x for x in rows if x["symbol"] == sym), None)
+        if row is None:
+            row = {"symbol": sym, "price": 1.0, "spread_pct": 0.02}
+            rows.append(row)
+        row.update(vals)
+        return rows
+
+    cases = [
+        ("A pumped coin", "DOGE/USDT",
+         dict(chg_24h_pct=22.0, chg_1h_pct=9.5, rsi_15m=86.0, vol_ratio=4.2, spread_pct=0.05),
+         dict(confidence=82, stop_loss_pct=2, take_profit_pct=4,
+              reason="Strong momentum, volume spike and a breakout, price is running."), True),
+        ("B target below break-even", "ETH/USDT",
+         dict(chg_24h_pct=0.4, chg_1h_pct=0.2, rsi_15m=52.0, vol_ratio=1.0, spread_pct=0.02),
+         dict(confidence=76, stop_loss_pct=1, take_profit_pct=0.6,
+              reason="Small bounce expected from the current level."), True),
+        ("C oversold bounce", "SOL/USDT",
+         dict(chg_24h_pct=-6.0, chg_1h_pct=-1.2, rsi_15m=29.0, vol_ratio=1.9, spread_pct=0.03),
+         dict(confidence=74, stop_loss_pct=1.5, take_profit_pct=3.2,
+              reason="Oversold bounce after a 6% daily drop, volume picking up while BTC is stable."), False),
+    ]
+    results = []
+    for name, sym, row, prop, must_reject in cases:
+        prop = dict(symbol=sym, **prop)
+        ctx = dict(base, market=market_with(sym, **row))
+        t = debate(prop, ctx)
+        if t["withdrawn"]:
+            verdict, why = "REJECT", "The Buyer withdrew after the Seller's challenge."
+        else:
+            out = llm_json(JUDGE_SYS, {**ctx, "buyer_proposals": [prop], "seller_proposals": [], "debates": [t]},
+                           JUDGE_MODEL)
+            v = next((x for x in out.get("verdicts", []) if x.get("symbol") == sym), {})
+            verdict, why = v.get("verdict", "NO ANSWER"), v.get("reason", "the Judge returned nothing usable")
+        print(f"JUDGETEST {name}: Seller says: {t['seller_challenge'][:180]}")
+        print(f"JUDGETEST {name}: Buyer replies: {t['buyer_reply'][:180]}")
+        print(f"JUDGETEST {name}: JUDGE -> {verdict}. {why[:220]}")
+        results.append((name, verdict, must_reject))
+    bad = [n for n, v, must in results if must and v == "APPROVE"]
+    broken = [n for n, v, _ in results if v == "NO ANSWER"]
+    c_verdict = next(v for n, v, _ in results if n.startswith("C"))
+    if broken:
+        print("JUDGETEST RESULT: FAILED, the AI did not answer for:", broken, "| check the llm error lines above")
+    elif bad:
+        print("JUDGETEST RESULT: WARNING, the Judge approved a bad idea:", bad, "| send these logs to Claude")
+    else:
+        print("JUDGETEST RESULT: PASSED. The Judge rejected both bad ideas. On the fair idea it said", c_verdict,
+              "(APPROVE means it will trade good setups, REJECT means it is strict and may trade rarely).")
+    open(marker, "w").write("ok")
+
+
 def hard_exits():
     """Risk engine: stop-loss, take-profit, time exit. No AI can override this."""
     for sym in list(pos):
@@ -548,6 +615,8 @@ if __name__ == "__main__":
     filter_universe()
     if not PAPER and os.getenv("SELFTEST", "").lower() in ("1", "yes", "true", "force"):
         selftest()
+    if os.getenv("JUDGETEST", "").lower() in ("1", "yes", "true", "force"):
+        judgetest()
     last_cycle = 0.0
     try:                                               # heartbeat: proves the bot can reach your website repo
         arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
