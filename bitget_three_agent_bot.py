@@ -12,7 +12,7 @@ Env:    ANTHROPIC_API_KEY   (required)
         BUYER_MODEL / SELLER_MODEL / JUDGE_MODEL  (optional; defaults haiku-5-5, haiku-5-5, sonnet-5-5)
 """
 import os, re, csv, json, time, requests, ccxt
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from anthropic import Anthropic
 import arena_feed as arena
 
@@ -33,6 +33,10 @@ START_USDT = float(os.getenv("START_USDT", "600"))   # capital the bot may use (
 MAX_POS = 3
 TRADE_PCT = 0.20            # 20% of equity per trade
 MIN_CONF = 70               # buyer confidence needed to even reach the judge
+DAILY_MIN_TRADES = int(os.getenv("DAILY_MIN_TRADES", "1"))          # daily trade goal, 0 turns it off
+QUOTA_AFTER_UTC_HOUR = int(os.getenv("QUOTA_AFTER_UTC_HOUR", "8"))  # goal mode starts 08:00 UTC = 13:30 IST
+QUOTA_MIN_CONF = 55         # lower bar while the daily goal is open (the Judge still decides)
+QUOTA_SIZE_FACTOR = 0.5     # the goal trade uses half the normal size
 FEE = 0.001                 # 0.1% per side
 MAX_SPREAD = 0.001          # skip if spread > 0.1%
 DAILY_LOSS = 0.05           # stop new entries at -5% on the day
@@ -53,7 +57,8 @@ day = datetime.now(timezone.utc).date()
 day_start_eq = START_USDT
 LAST = {}                   # latest fear/greed + judge mood + economics for the arena page
 LEDGER_FILE = os.path.join(DATA_DIR, "ledger.json")
-LEDGER = {"api_total": 0.0, "api_today": 0.0, "api_day": "", "fees_total": 0.0, "trades_total": 0, "debates_today": 0}
+LEDGER = {"api_total": 0.0, "api_today": 0.0, "api_day": "", "fees_total": 0.0, "trades_total": 0, "debates_today": 0,
+          "entries_today": 0, "idle_days": 0, "recent_trades": [], "tune": {}, "tune_note": ""}
 if os.path.exists(LEDGER_FILE):
     try:
         LEDGER.update(json.load(open(LEDGER_FILE)))
@@ -80,6 +85,7 @@ def switch_mode_if_needed():
         print("Mode changed, starting fresh ledger and arena history for", "PAPER" if PAPER else "LIVE")
         for k in ("api_total", "api_today", "fees_total", "trades_total", "debates_today"):
             LEDGER[k] = 0
+        LEDGER.update(entries_today=0, idle_days=0, recent_trades=[], tune={}, tune_note="")
         arena.reset()
     LEDGER["paper"] = PAPER
     save_ledger()
@@ -105,11 +111,43 @@ def init_state():
     save_state()
 
 
+def load_tune():
+    global MIN_CONF, TRADE_PCT
+    t = LEDGER.get("tune") or {}
+    MIN_CONF, TRADE_PCT = int(t.get("min_conf", MIN_CONF)), float(t.get("trade_pct", TRADE_PCT))
+
+
+def self_tune():
+    """Runs once a day. Rule-based and bounded: it only moves the confidence bar and the trade size inside hard
+    limits. It never touches stop-losses, the daily loss limit, max positions, the live/paper switch or the cap."""
+    global MIN_CONF, TRADE_PCT
+    last = LEDGER.get("recent_trades", [])[-10:]
+    notes = []
+    if len(last) >= 5:
+        wins, total = sum(1 for x in last if x > 0), sum(last)
+        if wins / len(last) < 0.35 or total < -0.03 * START_USDT:
+            MIN_CONF, TRADE_PCT = min(85, MIN_CONF + 5), max(0.10, round(TRADE_PCT - 0.02, 2))
+            notes.append(f"tightened after weak results ({wins}/{len(last)} wins, {total:+.2f} USDT)")
+        elif wins / len(last) >= 0.6 and total > 0:
+            MIN_CONF, TRADE_PCT = max(62, MIN_CONF - 3), min(0.20, round(TRADE_PCT + 0.01, 2))
+            notes.append(f"eased slightly after strong results ({wins}/{len(last)} wins, {total:+.2f} USDT)")
+    if LEDGER.get("idle_days", 0) >= 3:
+        MIN_CONF = max(62, MIN_CONF - 3)
+        notes.append(f"eased: no trade for {LEDGER['idle_days']} days")
+    LEDGER["tune"] = {"min_conf": MIN_CONF, "trade_pct": TRADE_PCT}
+    LEDGER["tune_note"] = "; ".join(notes) or "no change"
+    print("SELF-TUNE:", LEDGER["tune_note"], f"| min_conf={MIN_CONF} trade_pct={TRADE_PCT}")
+
+
 def roll_day():
     d = str(datetime.now(timezone.utc).date())
     if LEDGER["api_day"] != d:
+        if LEDGER["api_day"]:                          # a real day just ended, not the first start
+            LEDGER["idle_days"] = 0 if LEDGER.get("entries_today", 0) > 0 else LEDGER.get("idle_days", 0) + 1
+            self_tune()
         LEDGER["api_day"], LEDGER["api_today"] = d, 0.0
         LEDGER["debates_today"] = 0
+        LEDGER["entries_today"] = 0
 
 
 def track_cost(model, usage):
@@ -143,8 +181,14 @@ Claude API cost per trade). take_profit_pct must be at least economics.min_take_
 1.5x stop_loss_pct, and the expected gain must clearly beat break-even. If economics.costs_recovered is
 false, be pickier. stop_loss_pct between 1 and 5. Do not chase coins
 already up a lot with high RSI. Do not buy a coin you already hold.
+If the context contains "quota_mode", the account has no trade yet today: propose your single BEST acceptable
+idea even at confidence 55 to 69, but still no pumps, no falling knives, no wide spreads, and take_profit_pct
+must still clear economics.min_take_profit_pct. If nothing is acceptable, propose nothing.
+When you propose nothing, also give "best_candidate" (the closest idea with its confidence) and a one-sentence
+"note" on why nothing qualified.
 Reply ONLY with JSON: {"proposals":[{"symbol":"SOL/USDT","confidence":0-100,
-"stop_loss_pct":2,"take_profit_pct":4,"reason":"short"}]}"""
+"stop_loss_pct":2,"take_profit_pct":4,"reason":"short"}],
+"best_candidate":{"symbol":"SOL/USDT","confidence":55},"note":"short"}"""
 
 SELLER_SYS = """You are the SELLER trader. Review each open position with current prices, regime and news.
 Recommend SELL early only if the thesis broke, bad news hit, momentum turned, or profit is worth locking.
@@ -160,9 +204,12 @@ BUYER and SELLER. Approve a trade only if it makes sense in the current overall 
 Reject buys in a falling or panicky market, on hype-only pumps, or with weak reasoning. Reject sells
 that look like panic. Also REJECT any buy whose take-profit is below economics.min_take_profit_pct or
 whose reward is under 1.5x its risk. If economics.costs_recovered is false, demand stronger evidence.
-For each BUY you also get the Buyer/Seller debate in "debates", including buyer_confidence_after (below 60 means the
-Buyer lost the argument). Weigh the strongest points on both
+For each BUY you also get the Buyer/Seller debate in "debates", including buyer_confidence_after (below 50 means the
+Buyer lost the argument; a debate normally lowers confidence by 10 to 20 points). Weigh the strongest points on both
 sides and REJECT if the Seller's main risk was not convincingly answered.
+If "quota_mode" is present the account wants one small trade today: approve the best acceptable idea when its
+stop-loss is within 2%, its take-profit clears costs and it is not a pump, a falling knife or a wide spread.
+Otherwise REJECT.
 When unsure, REJECT.
 Reply ONLY with JSON: {"market_mood":"short","verdicts":[{"symbol":"SOL/USDT","side":"BUY or SELL",
 "verdict":"APPROVE or REJECT","reason":"short"}]}"""
@@ -243,11 +290,34 @@ def rsi(c, n=14):
     return 100 if l == 0 else 100 - 100 / (1 + g / l)
 
 
+def candles(sym):
+    """15m candles. ccxt first, then a direct Bitget call, then Binance public data (analysis only)."""
+    errs = []
+    try:
+        return ex.fetch_ohlcv(sym, "15m", limit=40)
+    except Exception as e:
+        errs.append(f"ccxt {type(e).__name__}: {str(e)[:100]}")
+    try:
+        r = requests.get("https://api.bitget.com/api/v2/spot/market/candles",
+                         params={"symbol": sym.replace("/", ""), "granularity": "15min", "limit": "40"}, timeout=10)
+        rows = sorted(r.json()["data"], key=lambda x: int(x[0]))
+        return [[int(x[0])] + [float(v) for v in x[1:6]] for x in rows]
+    except Exception as e:
+        errs.append(f"bitget-direct {type(e).__name__}: {str(e)[:100]}")
+    try:
+        r = requests.get("https://data-api.binance.vision/api/v3/klines",
+                         params={"symbol": sym.replace("/", ""), "interval": "15m", "limit": "40"}, timeout=10)
+        return [[int(x[0])] + [float(v) for v in x[1:6]] for x in r.json()]
+    except Exception as e:
+        errs.append(f"binance {type(e).__name__}: {str(e)[:100]}")
+    raise Exception(" | ".join(errs))
+
+
 def snapshot():
     out = []
     for s in UNIVERSE:
         try:
-            c = ex.fetch_ohlcv(s, "15m", limit=40)
+            c = candles(s)
             cl, v = [x[4] for x in c], [x[5] for x in c]
             tk = ex.fetch_ticker(s)
             out.append({"symbol": s, "price": tk["last"],
@@ -352,6 +422,7 @@ def buy(sym, size, sl, tp, reason):
         qty = held_qty(sym, qty)
     cash -= qty * price * (1 + FEE)
     LEDGER["fees_total"] += qty * price * FEE
+    LEDGER["entries_today"] = LEDGER.get("entries_today", 0) + 1
     save_ledger()
     pos[sym] = {"qty": qty, "entry": price, "t": time.time(), "sl": sl, "tp": tp}
     save_state()
@@ -391,6 +462,7 @@ def sell(sym, reason):
     cash += proceeds
     LEDGER["fees_total"] += p["qty"] * price * FEE
     LEDGER["trades_total"] += 1
+    LEDGER["recent_trades"] = (LEDGER.get("recent_trades", []) + [round(pnl, 4)])[-20:]
     save_ledger()
     save_state()
     log([datetime.now().isoformat(), sym, "SELL", price, p["qty"], round(pnl, 3), reason, round(cash, 2)])
@@ -462,6 +534,12 @@ def judgetest():
          dict(chg_24h_pct=-6.0, chg_1h_pct=-1.2, rsi_15m=29.0, vol_ratio=1.9, spread_pct=0.03),
          dict(confidence=74, stop_loss_pct=1.5, take_profit_pct=3.2,
               reason="Oversold bounce after a 6% daily drop, volume picking up while BTC is stable."), False),
+        ("D confirmed reversal", "LINK/USDT",
+         dict(chg_24h_pct=-5.5, chg_1h_pct=1.4, rsi_15m=41.0, vol_ratio=2.2, spread_pct=0.02),
+         dict(confidence=80, stop_loss_pct=1.5, take_profit_pct=3.5,
+              reason="After a 5.5% daily drop price has turned up 1.4% in the last hour on 2.2x volume, RSI is "
+                     "recovering from oversold and BTC is stable. Reversal confirmed by price and volume, "
+                     "reward 3.5% against a 1.5% stop."), False),
     ]
     results = []
     for name, sym, row, prop, must_reject in cases:
@@ -480,13 +558,16 @@ def judgetest():
     bad = [n for n, v, must in results if must and v == "APPROVE"]
     broken = [n for n, v, _ in results if v == "NO ANSWER"]
     c_verdict = next(v for n, v, _ in results if n.startswith("C"))
+    d_verdict = next(v for n, v, _ in results if n.startswith("D"))
     if broken:
         print("JUDGETEST RESULT: FAILED, the AI did not answer for:", broken, "| check the llm error lines above")
     elif bad:
         print("JUDGETEST RESULT: WARNING, the Judge approved a bad idea:", bad, "| send these logs to Claude")
     else:
-        print("JUDGETEST RESULT: PASSED. The Judge rejected both bad ideas. On the fair idea it said", c_verdict,
-              "(APPROVE means it will trade good setups, REJECT means it is strict and may trade rarely).")
+        print("JUDGETEST RESULT: PASSED. The Judge rejected both bad ideas (A, B). Unconfirmed idea C:", c_verdict,
+              "| strong confirmed idea D:", d_verdict,
+              "-> the Judge CAN approve a good setup, so trades are possible." if d_verdict == "APPROVE" else
+              "-> WARNING: it rejected even a strong setup. It may be too strict, send these logs to Claude.")
     open(marker, "w").write("ok")
 
 
@@ -512,14 +593,17 @@ def halted():
     return equity() <= day_start_eq * (1 - DAILY_LOSS)
 
 
-def cycle():
+def _cycle(A):
     roll_day()
     if LEDGER["api_today"] >= MAX_API_DAILY:
         print("Daily Claude budget reached, skipping AI cycle:", round(LEDGER["api_today"], 3))
+        A["note"] = "Daily Claude budget reached, AI paused until tomorrow"
         return
     snap, nws = snapshot(), news()
     reg = regime(snap)
     LAST["fg"] = reg["fear_greed"]
+    A.update(scanned=len(snap), btc_1h=reg.get("btc_1h_pct"), fg=reg["fear_greed"])
+    LAST["prices"] = {x["symbol"]: x["price"] for x in snap}
     arena.update_prices({x["symbol"]: x["price"] for x in snap})
     eq = equity()
     eco = economics(eq)
@@ -536,11 +620,21 @@ def cycle():
     ctx = {"market": snap, "regime": reg, "news": nws, "economics": eco,
            "portfolio": {"cash": round(cash, 2), "equity": round(eq, 2), "positions": holdings}}
 
-    stop_buys = halted() or len(pos) >= MAX_POS or not NEW_ENTRIES
-    min_conf = MIN_CONF + (0 if eco["costs_recovered"] else 5)     # pickier while costs are unrecovered
-    buys = [] if stop_buys else llm_json(BUYER_SYS, ctx, BUYER_MODEL).get("proposals", [])
+    stop_why = ("daily loss limit reached" if halted() else "maximum open positions" if len(pos) >= MAX_POS
+                else "new entries are switched off" if not NEW_ENTRIES else "")
+    stop_buys = bool(stop_why)
+    quota = (not stop_buys and DAILY_MIN_TRADES > 0 and LEDGER.get("entries_today", 0) < DAILY_MIN_TRADES
+             and datetime.now(timezone.utc).hour >= QUOTA_AFTER_UTC_HOUR)
+    if quota:
+        ctx["quota_mode"] = {"active": True, "reason": "no trade opened yet today"}
+    min_conf = QUOTA_MIN_CONF if quota else MIN_CONF + (0 if eco["costs_recovered"] else 5)
+    out_b = {} if stop_buys else llm_json(BUYER_SYS, ctx, BUYER_MODEL)
+    A.update(quota=quota, note=(f"No new buys: {stop_why}" if stop_buys else out_b.get("note")),
+             best=out_b.get("best_candidate"))
+    buys = out_b.get("proposals", []) or []
     buys = [b for b in buys if b.get("symbol") in UNIVERSE and b.get("symbol") not in pos
             and float(b.get("confidence", 0)) >= min_conf]
+    A["ideas"] = len(buys)
     transcripts, kept = [], []
     for b in buys:                                     # Buyer vs Seller debate, capped per day
         if LEDGER.get("debates_today", 0) >= DEBATES_PER_DAY:
@@ -549,6 +643,7 @@ def cycle():
         LEDGER["debates_today"] = LEDGER.get("debates_today", 0) + 1
         save_ledger()
         t = debate(b, ctx)
+        A["debated"] = A.get("debated", 0) + 1
         transcripts.append(t)
         for k, v in (("stop_loss_pct", t["revised_sl"]), ("take_profit_pct", t["revised_tp"])):
             if isinstance(v, (int, float)):
@@ -577,6 +672,7 @@ def cycle():
     out = llm_json(JUDGE_SYS, {**ctx, "buyer_proposals": buys, "seller_proposals": sells, "debates": transcripts}, JUDGE_MODEL)
     print("Judge mood:", out.get("market_mood"))
     LAST["mood"] = out.get("market_mood", "")
+    A["mood"] = out.get("market_mood", "")
     why = {(v.get("symbol"), v.get("side")): v.get("reason", "") for v in out.get("verdicts", [])}
     ok = {(v.get("symbol"), v.get("side")): v.get("reason", "") for v in out.get("verdicts", [])
           if v.get("verdict") == "APPROVE"}
@@ -590,25 +686,66 @@ def cycle():
             px = next((x["price"] for x in snap if x["symbol"] == b["symbol"]), None)
             arena.add_case(b["symbol"], "BUY", b.get("confidence"), *court(b, tmap),
                            "REJECT", why.get(key, "Not approved."), px)
+            A["vetoed"] = A.get("vetoed", 0) + 1
             continue
         if len(pos) >= MAX_POS or halted():
             continue
         sl = min(max(float(b.get("stop_loss_pct", 2)), 1), 5) / 100
         tp = max(float(b.get("take_profit_pct", 3)), sl * 150, eco["min_take_profit_pct"]) / 100
-        size = min(cash, equity() * TRADE_PCT)
+        size = min(cash, equity() * TRADE_PCT * (QUOTA_SIZE_FACTOR if quota else 1))
         if size >= 10:
             buy(b["symbol"], size, sl, tp, f'agents: {b.get("reason", "")} | judge: {ok[key]}')
             if b["symbol"] in pos:                     # buy really happened: record the approved case
                 arena.add_case(b["symbol"], "BUY", b.get("confidence"), *court(b, tmap),
                                "APPROVE", ok[key], pos[b["symbol"]]["entry"])
+                A["bought"] = A.get("bought", 0) + 1
+
+
+def cycle():
+    A = {"t": datetime.now(timezone.utc).strftime("%H:%M"), "scanned": 0, "ideas": 0, "debated": 0}
+    try:
+        _cycle(A)
+    except Exception as e:
+        A["error"] = f"{type(e).__name__}: {str(e)[:120]}"
+        raise
+    finally:
+        arena.add_activity(A)
+
+
+def live_extra():
+    """Extra fields for the website: open positions, self-tuning, daily goal, next check."""
+    pr = []
+    for s_, p_ in pos.items():
+        try:
+            px = ex.fetch_ticker(s_)["last"]
+        except Exception:
+            px = (LAST.get("prices") or {}).get(s_, p_["entry"])
+        pr.append({"symbol": s_, "entry": p_["entry"], "price": px, "pnl_pct": round((px / p_["entry"] - 1) * 100, 2),
+                   "held_min": int((time.time() - p_["t"]) / 60), "sl_pct": round(p_["sl"] * 100, 2),
+                   "tp_pct": round(p_["tp"] * 100, 2)})
+    return {"positions": pr,
+            "tuning": {"min_conf": MIN_CONF, "trade_pct": TRADE_PCT, "note": LEDGER.get("tune_note", ""),
+                       "idle_days": LEDGER.get("idle_days", 0)},
+            "daily_goal": {"min_trades": DAILY_MIN_TRADES, "entries_today": LEDGER.get("entries_today", 0),
+                           "after_utc_hour": QUOTA_AFTER_UTC_HOUR},
+            "next_check_utc": (datetime.now(timezone.utc) + timedelta(seconds=DECISION_EVERY)).isoformat()}
 
 
 if __name__ == "__main__":
     print("PAPER mode" if PAPER else "LIVE mode (REAL MONEY)", "- 3-agent bot starting")
     if not PAPER and not (os.getenv("BITGET_KEY") and os.getenv("BITGET_SECRET") and os.getenv("BITGET_PASSPHRASE")):
         raise SystemExit("LIVE mode needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
+    vol = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    if not vol:
+        print("WARNING: no Railway volume detected. History, costs and OPEN POSITIONS are lost on every restart. "
+              "Attach a volume at /data and set DATA_DIR=/data.")
+    elif not os.path.abspath(DATA_DIR).startswith(vol):
+        print(f"WARNING: DATA_DIR={DATA_DIR} is not inside the volume ({vol}). Set DATA_DIR={vol}")
+    else:
+        print("Data folder is on a persistent volume:", DATA_DIR)
     switch_mode_if_needed()
     init_state()
+    load_tune()
     filter_universe()
     if not PAPER and os.getenv("SELFTEST", "").lower() in ("1", "yes", "true", "force"):
         selftest()
@@ -616,19 +753,22 @@ if __name__ == "__main__":
         judgetest()
     last_cycle = 0.0
     try:                                               # heartbeat: proves the bot can reach your website repo
-        arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
+        arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None, live_extra())
     except Exception as e:
         print("startup publish error:", repr(e))
     while True:
         t0 = time.time()
         try:
+            before = set(pos)
             hard_exits()
+            if set(pos) != before:                     # a position was closed: show it on the page now
+                arena.publish(equity(), START_USDT, LAST.get("fg"), LAST.get("mood"), PAPER, LAST.get("eco"), live_extra())
             if t0 - last_cycle >= DECISION_EVERY:
                 last_cycle = t0
                 try:
                     cycle()
                 finally:                               # the page updates even if the cycle hit an error
-                    arena.publish(equity(), START_USDT, LAST.get("fg"), LAST.get("mood"), PAPER, LAST.get("eco"))
+                    arena.publish(equity(), START_USDT, LAST.get("fg"), LAST.get("mood"), PAPER, LAST.get("eco"), live_extra())
         except Exception as e:
             print("error:", repr(e))
         time.sleep(max(1, CHECK_EVERY - (time.time() - t0)))
