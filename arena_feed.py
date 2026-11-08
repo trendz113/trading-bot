@@ -6,6 +6,8 @@ salarybit.in (GitHub Pages) shows it live.
 Optional env vars for the push (use a fine-grained token with Contents:write
 on that ONE repo only):
   GITHUB_TOKEN, GITHUB_REPO (e.g. trendz113/salarybit), GITHUB_PATH (default arena.json)
+  GITHUB_BRANCH (optional: push to a separate data branch so your site history is not flooded)
+  GITHUB_MIN_INTERVAL (seconds between pushes unless a trade happened, default 300)
 """
 import os, json, base64, time, requests
 from datetime import datetime, timezone
@@ -16,6 +18,7 @@ KEEP = 60                       # cases kept on the page
 VETO_WINDOW_H = 4               # how long a vetoed idea is tracked for "would have" result
 
 STATE = {"cases": []}
+_LAST_PUSH = [0.0]
 if os.path.exists(FILE):
     try:
         STATE = json.load(open(FILE))
@@ -23,13 +26,13 @@ if os.path.exists(FILE):
         pass
 
 
-def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, judge_reason, price):
-    """Call once per Judge decision on a BUY idea. verdict: APPROVE or REJECT."""
+def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, judge_reason, price, size_usdt=None):
+    """Call once per decision on a BUY idea. verdict: APPROVE or REJECT. size_usdt lets open trades show USDT P&L."""
     ok = verdict == "APPROVE"
     STATE["cases"].insert(0, {
         "ts": time.time(),
         "time": datetime.now().strftime("%d %b %H:%M"),
-        "symbol": symbol, "side": side, "price": price,
+        "symbol": symbol, "side": side, "price": price, "size_usdt": size_usdt,
         "buyer": {"confidence": confidence, "reason": buyer_reason},
         "seller": {"reason": seller_reason} if seller_reason else None,
         "judge": {"verdict": "APPROVE" if ok else "REJECT", "reason": judge_reason},
@@ -47,6 +50,8 @@ def update_prices(prices):
             continue
         if o["status"] == "open":
             o["pnl_pct"] = round((px / p0 - 1) * 100, 2)
+            if c.get("size_usdt"):                    # gross of fees; the final closed value is net
+                o["pnl_usdt"] = round(c["size_usdt"] * (px / p0 - 1), 2)
         elif o["status"] == "vetoed" and (time.time() - c["ts"]) / 3600 <= VETO_WINDOW_H:
             o["would_have_pct"] = round((px / p0 - 1) * 100, 2)
 
@@ -60,7 +65,6 @@ def reset():
         pass
     STATE["cases"] = []
     STATE["activity"] = []
-    STATE["activity"] = []
 
 
 def add_activity(entry):
@@ -70,10 +74,10 @@ def add_activity(entry):
 
 
 def set_note(symbol, text):
-    """Latest Seller update for an open position (HOLD/SELL reasoning), shown on the page."""
+    """Latest update for an open position. Stored separately so the original arguments are never overwritten."""
     for c in STATE["cases"]:
         if c["symbol"] == symbol and c["outcome"]["status"] == "open":
-            c["seller"] = {"reason": text}
+            c["note"] = text
             return
 
 
@@ -86,7 +90,7 @@ def close_trade(symbol, pnl_usdt, pnl_pct, reason=""):
             return
 
 
-def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None, extra=None):
+def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None, extra=None, force=False):
     out = {
         "updated": datetime.now(timezone.utc).isoformat(),
         "mode": "paper" if paper else "live",
@@ -105,15 +109,22 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None,
     if not tok or not repo:
         print("arena: GITHUB_TOKEN or GITHUB_REPO is not set, so the website will NOT update")
         return
+    gap = float(os.getenv("GITHUB_MIN_INTERVAL", "300"))
+    if not force and time.time() - _LAST_PUSH[0] < gap:      # keeps the repo from getting ~100 commits a day
+        return
     try:
+        branch = os.getenv("GITHUB_BRANCH")
         url = f"https://api.github.com/repos/{repo}/contents/{os.getenv('GITHUB_PATH', 'arena.json')}"
         h = {"Authorization": f"Bearer {tok}", "Accept": "application/vnd.github+json"}
-        r = requests.get(url, headers=h, timeout=15)
+        r = requests.get(url, headers=h, params={"ref": branch} if branch else None, timeout=15)
         body = {"message": "arena update", "content": base64.b64encode(text.encode()).decode()}
+        if branch:
+            body["branch"] = branch
         if r.ok:
             body["sha"] = r.json().get("sha")
         pr = requests.put(url, headers=h, json=body, timeout=15)
         if pr.ok:
+            _LAST_PUSH[0] = time.time()
             print("arena: arena.json pushed to", repo)
         else:
             print("arena: push FAILED", pr.status_code, pr.text[:200])
