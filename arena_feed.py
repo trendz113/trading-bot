@@ -11,6 +11,7 @@ import os, json, base64, time, requests
 from datetime import datetime, timezone
 
 FILE = os.path.join(os.getenv("DATA_DIR", "."), "arena.json")
+os.makedirs(os.path.dirname(FILE) or ".", exist_ok=True)
 KEEP = 60                       # cases kept on the page
 VETO_WINDOW_H = 4               # how long a vetoed idea is tracked for "would have" result
 
@@ -81,6 +82,7 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None)
 
     tok, repo = os.getenv("GITHUB_TOKEN"), os.getenv("GITHUB_REPO")
     if not tok or not repo:
+        print("arena: GITHUB_TOKEN or GITHUB_REPO is not set, so the website will NOT update")
         return
     try:
         url = f"https://api.github.com/repos/{repo}/contents/{os.getenv('GITHUB_PATH', 'arena.json')}"
@@ -89,6 +91,10 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None)
         body = {"message": "arena update", "content": base64.b64encode(text.encode()).decode()}
         if r.ok:
             body["sha"] = r.json().get("sha")
-        requests.put(url, headers=h, json=body, timeout=15).raise_for_status()
+        pr = requests.put(url, headers=h, json=body, timeout=15)
+        if pr.ok:
+            print("arena: arena.json pushed to", repo)
+        else:
+            print("arena: push FAILED", pr.status_code, pr.text[:200])
     except Exception as e:
         print("arena push failed:", e)
