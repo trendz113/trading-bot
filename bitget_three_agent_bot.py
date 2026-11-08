@@ -28,7 +28,7 @@ DAILY_API_EST = 0.25        # USD/day estimate until real spend is higher
 DEBATES_PER_DAY = 20        # max Buyer/Seller debates per day (this also caps Judge cost)
 EDGE_SAFETY = 0.3           # extra % margin on top of break-even
 UNIVERSE = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "DOGE/USDT",
-            "ADA/USDT", "LINK/USDT", "AVAX/USDT", "TON/USDT", "SUI/USDT", "LTC/USDT"]
+            "ADA/USDT", "LINK/USDT", "AVAX/USDT", "DOT/USDT", "SUI/USDT", "LTC/USDT"]
 START_USDT = float(os.getenv("START_USDT", "600"))   # capital the bot may use (live: capped to your real USDT balance)
 MAX_POS = 3
 TRADE_PCT = 0.20            # 20% of equity per trade
@@ -167,15 +167,37 @@ Reply ONLY with JSON: {"market_mood":"short","verdicts":[{"symbol":"SOL/USDT","s
 "verdict":"APPROVE or REJECT","reason":"short"}]}"""
 
 
+def think_kwargs(model):
+    """Claude 5.5 models think by default and start replies with a thinking block.
+    Haiku: thinking off. Sonnet: lowest setting. This keeps cost and delay low."""
+    m = model.lower()
+    if "haiku-5-5" in m:
+        return {"thinking": {"type": "disabled"}}
+    if "sonnet-5-5" in m:
+        return {"thinking": {"type": "between_tools"}}
+    return {}
+
+
 def llm_json(system, payload, model):
+    msgs = [{"role": "user", "content": json.dumps(payload)}]
+    r = None
+    for kw in (think_kwargs(model), {}):               # if the API rejects the thinking setting, retry without it
+        try:
+            r = client.messages.create(model=model, max_tokens=3000, system=system, messages=msgs, **kw)
+            break
+        except Exception as e:
+            print("llm error:", repr(e)[:300])
+            if not kw:
+                return {}
+    t = ""
     try:
-        r = client.messages.create(model=model, max_tokens=1200, system=system,
-                                   messages=[{"role": "user", "content": json.dumps(payload)}])
         track_cost(model, r.usage)
-        t = r.content[0].text.strip().replace("```json", "").replace("```", "")
-        return json.loads(t)
+        # read the answer by block type: the first block can be a thinking block
+        t = "".join(blk.text for blk in r.content if getattr(blk, "type", "") == "text").strip()
+        t = t.replace("```json", "").replace("```", "")
+        return json.loads(t[t.find("{"):t.rfind("}") + 1])
     except Exception as e:
-        print("llm error:", e)
+        print("llm parse error:", repr(e)[:200], "| raw:", t[:200])
         return {}
 
 
@@ -233,6 +255,18 @@ def snapshot():
         except Exception as e:
             print("snapshot skip", s, e)
     return out
+
+
+def filter_universe():
+    """Drop coins that Bitget spot does not list, so no cycle wastes time on them."""
+    try:
+        ex.load_markets()
+        gone = [x for x in UNIVERSE if x not in ex.markets]
+        UNIVERSE[:] = [x for x in UNIVERSE if x in ex.markets]
+        if gone:
+            print("Not available on Bitget spot, skipped:", gone)
+    except Exception as e:
+        print("market check failed:", repr(e))
 
 
 def regime(snap):
@@ -484,6 +518,7 @@ if __name__ == "__main__":
         raise SystemExit("LIVE mode needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
     switch_mode_if_needed()
     init_state()
+    filter_universe()
     last_cycle = 0.0
     try:                                               # heartbeat: proves the bot can reach your website repo
         arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
