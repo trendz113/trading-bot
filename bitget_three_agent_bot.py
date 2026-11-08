@@ -39,6 +39,7 @@ MAX_HOLD_H = 6              # time exit
 CHECK_EVERY = 60            # seconds: hard stop-loss / take-profit checks (no AI cost)
 DECISION_EVERY = 900        # seconds: AI cycle (15 min keeps API cost sensible)
 DATA_DIR = os.getenv("DATA_DIR", ".")      # point this at a Railway volume so history survives restarts
+os.makedirs(DATA_DIR, exist_ok=True)
 LOG = os.path.join(DATA_DIR, "agent_trades.csv")
 
 client = Anthropic()
@@ -400,14 +401,20 @@ def cycle():
 if __name__ == "__main__":
     print("PAPER mode" if PAPER else "LIVE mode", "- 3-agent bot starting")
     last_cycle = 0.0
+    try:                                               # heartbeat: proves the bot can reach your website repo
+        arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
+    except Exception as e:
+        print("startup publish error:", repr(e))
     while True:
         t0 = time.time()
         try:
             hard_exits()
             if t0 - last_cycle >= DECISION_EVERY:
                 last_cycle = t0
-                cycle()
-                arena.publish(equity(), START_USDT, LAST.get("fg"), LAST.get("mood"), PAPER, LAST.get("eco"))
+                try:
+                    cycle()
+                finally:                               # the page updates even if the cycle hit an error
+                    arena.publish(equity(), START_USDT, LAST.get("fg"), LAST.get("mood"), PAPER, LAST.get("eco"))
         except Exception as e:
-            print("error:", e)
+            print("error:", repr(e))
         time.sleep(max(1, CHECK_EVERY - (time.time() - t0)))
