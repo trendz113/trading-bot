@@ -51,6 +51,16 @@ def update_prices(prices):
             o["would_have_pct"] = round((px / p0 - 1) * 100, 2)
 
 
+def reset():
+    """Called when switching between paper and live so the two histories never mix."""
+    try:
+        if os.path.exists(FILE):
+            os.replace(FILE, FILE.replace(".json", "_backup.json"))
+    except Exception:
+        pass
+    STATE["cases"] = []
+
+
 def set_note(symbol, text):
     """Latest Seller update for an open position (HOLD/SELL reasoning), shown on the page."""
     for c in STATE["cases"]:
