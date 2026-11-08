@@ -46,16 +46,32 @@ h2{margin:26px 0 10px;font-size:15px;color:var(--gold);text-transform:uppercase;
 .bd.lock{border-color:var(--line);color:var(--mut);filter:grayscale(1);opacity:.6}
 footer{margin-top:28px;font-size:11px;color:var(--mut);text-align:center}
 </style>
+<meta property="og:type" content="website">
+<meta property="og:title" content="AI Trading Arena | SalaryBit">
+<meta property="og:description" content="Free tool from SalaryBit for Indian salaried professionals. No login, no data stored.">
+<meta property="og:url" content="https://salarybit.in/trading-arena.html">
+<meta property="og:site_name" content="SalaryBit">
+<meta property="og:image" content="https://salarybit.in/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="AI Trading Arena | SalaryBit">
+<meta name="twitter:description" content="Free tool from SalaryBit for Indian salaried professionals. No login, no data stored.">
+<meta name="twitter:image" content="https://salarybit.in/og-image.png">
+<link rel="canonical" href="https://salarybit.in/trading-arena.html">
 </head>
 <body>
 <h1>⚖️ AI Trading Arena</h1>
 <p class="sub">Bull pitches, Bear objects, the Judge decides. Every call is logged, wins and vetoes included.</p>
-<div class="note">Paper-trading experiment for learning and fun. This is not investment advice and not a tip service.</div>
+<div class="note" id="modenote">Paper-trading experiment for learning and fun. This is not investment advice and not a tip service.</div>
 <div class="note demo" id="demo">Showing demo data. Connect arena.json from the bot to go live.</div>
 
 <div class="score" id="score"></div>
 <div class="note" id="costs" style="display:none"></div>
 <div class="mood" id="mood"></div>
+<div class="note" id="status">Waiting for the bot...</div>
+<h2>Open Positions</h2><div id="positions"></div>
+<h2>Scanner Log</h2><div id="scanlog"></div>
 
 <h2>The Cast</h2>
 <div class="cast">
@@ -98,7 +114,47 @@ async function load(){
   catch(e){ return {d:DEMO, demo:true}; }
 }
 
+function renderExtras(d, demo){
+  var upd = d.updated ? new Date(d.updated) : null;
+  var mins = upd && !isNaN(upd) ? Math.round((Date.now() - upd.getTime()) / 60000) : null;
+  var t = upd && !isNaN(upd) ? upd.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "?";
+  var h;
+  if (demo) { h = "Demo data. The bot is not connected yet."; }
+  else {
+    h = (mins !== null && mins <= 25 ? "🟢 Bot online" : "🔴 No update for " + mins + " min") +
+        " · last check " + t + (mins !== null ? " (" + mins + " min ago)" : "") + " · it checks every 15 minutes";
+    if (d.daily_goal) h += "<br>Trades opened today: " + esc(d.daily_goal.entries_today) + " (daily goal " + esc(d.daily_goal.min_trades) + ")";
+    if (d.tuning) h += "<br>Self-tuning: confidence bar " + esc(d.tuning.min_conf) + ", trade size " + Math.round(d.tuning.trade_pct * 100) + "% of balance. " + esc(d.tuning.note || "");
+  }
+  document.getElementById("status").innerHTML = h;
+  var ps = d.positions || [];
+  document.getElementById("positions").innerHTML = ps.length ? ps.map(function(p){
+    var up = p.pnl_pct >= 0;
+    return '<div class="case"><div class="meta">' + esc(p.symbol) + ' · held ' + esc(p.held_min) + ' min</div>' +
+      '<div class="ln">Entry ' + esc(p.entry) + ' · now ' + esc(p.price) + ' · <b class="' + (up ? "up" : "down") + '">' + (up ? "+" : "") + esc(p.pnl_pct) + '%</b></div>' +
+      '<div class="ln">Stop-loss -' + esc(p.sl_pct) + '% · target +' + esc(p.tp_pct) + '%</div></div>';
+  }).join("") : '<div class="note">No open positions right now.</div>';
+  var ac = d.activity || [];
+  document.getElementById("scanlog").innerHTML = ac.length ? ac.slice(0, 12).map(function(a){
+    var btc = (a.btc_1h === null || a.btc_1h === undefined) ? "n/a" : a.btc_1h + "%";
+    var s = esc(a.t) + " UTC · scanned " + esc(a.scanned) + " coins · BTC 1h " + esc(btc) + " · " + esc(a.fg || "") +
+      " · ideas " + esc(a.ideas) + " · debates " + esc(a.debated || 0);
+    if (a.bought) s += " · ✅ bought " + esc(a.bought);
+    if (a.vetoed) s += " · 🚫 vetoed " + esc(a.vetoed);
+    if (a.quota) s += " · daily-goal mode";
+    if (a.note) s += "<br>" + esc(a.note);
+    if (a.best && a.best.symbol) s += "<br>Closest idea: " + esc(a.best.symbol) + " (confidence " + esc(a.best.confidence) + ")";
+    if (a.error) s += '<br><span class="down">Error: ' + esc(a.error) + "</span>";
+    return '<div class="note">' + s + "</div>";
+  }).join("") : '<div class="note">No checks recorded yet.</div>';
+}
+
 function render(d, demo){
+  try { renderExtras(d, demo); } catch (e) {}
+  const isLive = !demo && d.mode === "live";
+  $("modenote").textContent = isLive
+    ? "💰 Real-money experiment: this bot trades a small amount of its owner’s own money on Bitget. Every result here is real, wins and losses included. This is not investment advice and not a tip service."
+    : "Paper-trading experiment for learning and fun. This is not investment advice and not a tip service.";
   $("demo").style.display = demo ? "block" : "none";
   const cases = d.cases || [];
   const closed = cases.filter(c => c.outcome && c.outcome.status === "closed");
