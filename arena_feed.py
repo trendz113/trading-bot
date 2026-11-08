@@ -59,6 +59,14 @@ def reset():
     except Exception:
         pass
     STATE["cases"] = []
+    STATE["activity"] = []
+    STATE["activity"] = []
+
+
+def add_activity(entry):
+    """One line per AI cycle (what the bot looked at and decided) so the page always shows life."""
+    STATE.setdefault("activity", []).insert(0, entry)
+    del STATE["activity"][60:]
 
 
 def set_note(symbol, text):
@@ -78,7 +86,7 @@ def close_trade(symbol, pnl_usdt, pnl_pct, reason=""):
             return
 
 
-def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None):
+def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None, extra=None):
     out = {
         "updated": datetime.now(timezone.utc).isoformat(),
         "mode": "paper" if paper else "live",
@@ -86,7 +94,10 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None)
         "mood": {"fear_greed": fear_greed or "unknown", "text": mood_text or ""},
         "costs": costs,
         "cases": STATE["cases"],
+        "activity": STATE.get("activity", [])[:40],
     }
+    if extra:
+        out.update(extra)
     text = json.dumps(out, ensure_ascii=False)
     open(FILE, "w", encoding="utf-8").write(text)
 
