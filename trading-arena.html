@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AI Trading Arena | SalaryBit</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0a1a;--card:#15132b;--line:#2a2750;--txt:#eaeaff;--mut:#9a98c8;--green:#2ee59d;--red:#ff4d6d;--gold:#ffd166;--neon:#7c9cff;--pink:#ff7ce5;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{max-width:760px;margin:0 auto;padding:14px 14px 40px;background:radial-gradient(circle at 50% -10%,#241f5c 0,var(--bg) 55%) no-repeat}
+h1{margin:6px 0 2px;font-size:26px;letter-spacing:.5px;text-shadow:0 0 18px var(--neon)}
+h2{margin:26px 0 10px;font-size:15px;color:var(--gold);text-transform:uppercase;letter-spacing:1.5px}
+.sub{color:var(--mut);margin:0 0 10px;font-size:14px}
+.note{border:1px solid var(--line);background:#1b1840;color:var(--mut);font-size:12px;padding:8px 10px;border-radius:10px;margin:8px 0}
+.demo{display:none;background:#3a2a05;color:var(--gold);border-color:#6b4d0a}
+.score{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;text-align:center}
+.stat b{display:block;font-size:19px}.stat span{font-size:11px;color:var(--mut)}
+.up{color:var(--green)}.down{color:var(--red)}
+.mood{display:flex;align-items:center;gap:10px;margin-top:10px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px}
+.mood .e{font-size:30px}.mood small{color:var(--mut)}
+.cast{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.char{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 8px;text-align:center}
+.av{font-size:40px;animation:bob 2.4s ease-in-out infinite}
+.char:nth-child(2) .av{animation-delay:.4s}.char:nth-child(3) .av{animation-delay:.8s}
+@keyframes bob{50%{transform:translateY(-5px)}}
+.char b{display:block;font-size:13px}
+.bub{margin-top:6px;font-size:11px;line-height:1.35;color:var(--mut);background:#0f0d24;border-radius:10px;padding:7px;min-height:58px}
+.case{position:relative;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:10px;overflow:hidden}
+.meta{font-size:12px;color:var(--mut);margin-bottom:6px}
+.ln{font-size:13px;line-height:1.45;margin:4px 0}
+.stamp{position:absolute;top:10px;right:10px;font-weight:900;font-size:13px;padding:3px 9px;border:2px solid;border-radius:6px;transform:rotate(-8deg);animation:slam .5s ease-out}
+.stamp.ok{color:var(--green);border-color:var(--green)}.stamp.no{color:var(--red);border-color:var(--red)}
+@keyframes slam{0%{transform:scale(2.4) rotate(-8deg);opacity:0}100%{transform:scale(1) rotate(-8deg);opacity:1}}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.tc{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px;position:relative}
+.tc.win{border-color:var(--green);box-shadow:0 0 14px rgba(46,229,157,.25)}
+.tc.loss{border-color:var(--red);box-shadow:0 0 14px rgba(255,77,109,.25)}
+.tc .sym{font-weight:800}.tc .pnl{font-size:20px;font-weight:800;margin-top:4px}
+.tc .st{font-size:11px;color:var(--mut)}
+.pop{position:absolute;right:8px;top:6px;font-size:20px;animation:bob 1.6s infinite}
+.badges{display:flex;flex-wrap:wrap;gap:8px}
+.bd{background:var(--card);border:1px solid var(--gold);color:var(--gold);border-radius:20px;padding:6px 12px;font-size:12px}
+.bd.lock{border-color:var(--line);color:var(--mut);filter:grayscale(1);opacity:.6}
+footer{margin-top:28px;font-size:11px;color:var(--mut);text-align:center}
+</style>
+</head>
+<body>
+<h1>⚖️ AI Trading Arena</h1>
+<p class="sub">Bull pitches, Bear objects, the Judge decides. Every call is logged, wins and vetoes included.</p>
+<div class="note">Paper-trading experiment for learning and fun. This is not investment advice and not a tip service.</div>
+<div class="note demo" id="demo">Showing demo data. Connect arena.json from the bot to go live.</div>
+
+<div class="score" id="score"></div>
+<div class="note" id="costs" style="display:none"></div>
+<div class="mood" id="mood"></div>
+
+<h2>The Cast</h2>
+<div class="cast">
+  <div class="char"><div class="av">🐂</div><b>Buyer Bull</b><div class="bub" id="b1"></div></div>
+  <div class="char"><div class="av">🐻</div><b>Seller Bear</b><div class="bub" id="b2"></div></div>
+  <div class="char"><div class="av">⚖️</div><b>Judge</b><div class="bub" id="b3"></div></div>
+</div>
+
+<h2>Courtroom Feed</h2><div id="feed"></div>
+<h2>Trade Cards</h2><div class="grid" id="cards"></div>
+<h2>Badges</h2><div class="badges" id="badges"></div>
+<footer>Updates every minute. Not financial advice. Crypto is risky and you can lose money.</footer>
+
+<script>
+const DATA_URL = "arena.json";
+/* arena.json shape:
+{"updated":"ISO","start_equity":600,"equity":612.4,
+ "mood":{"fear_greed":"38 (Fear)","text":"Cautious market, BTC flat"},
+ "cases":[{"time":"10:15","symbol":"SOL/USDT","side":"BUY",
+   "buyer":{"confidence":78,"reason":"..."},"seller":{"reason":"..."},
+   "judge":{"verdict":"APPROVE|REJECT","reason":"..."},
+   "outcome":{"status":"open|closed|vetoed","pnl_pct":1.4,"pnl_usdt":2.1,"would_have_pct":-2.0}}]} */
+const DEMO = {updated:"demo",start_equity:600,equity:608.7,
+ mood:{fear_greed:"38 (Fear)",text:"Cautious market, BTC flat. Judge is picky today."},
+ cases:[
+ {time:"14:30",symbol:"SUI/USDT",side:"BUY",buyer:{confidence:81,reason:"Volume spike with a clean breakout above resistance."},seller:{reason:"RSI already high, could be a late entry."},judge:{verdict:"APPROVE",reason:"BTC steady and no negative news. Small size is fine."},outcome:{status:"open",pnl_pct:0.6,pnl_usdt:0.9}},
+ {time:"12:05",symbol:"DOGE/USDT",side:"BUY",buyer:{confidence:72,reason:"Social hype and a sharp 1h pump."},seller:null,judge:{verdict:"REJECT",reason:"Hype-only pump in a fearful market. Passing."},outcome:{status:"vetoed",would_have_pct:-2.4}},
+ {time:"10:40",symbol:"SOL/USDT",side:"BUY",buyer:{confidence:78,reason:"EMA cross-up with rising volume."},seller:{reason:"No objection."},judge:{verdict:"APPROVE",reason:"Trend and news both supportive."},outcome:{status:"closed",pnl_pct:2.8,pnl_usdt:4.2}},
+ {time:"09:10",symbol:"LINK/USDT",side:"BUY",buyer:{confidence:74,reason:"Bounce from support."},seller:{reason:"Downtrend still intact."},judge:{verdict:"APPROVE",reason:"Risk is capped by the stop-loss."},outcome:{status:"closed",pnl_pct:-0.9,pnl_usdt:-1.4}},
+ {time:"Yesterday",symbol:"XRP/USDT",side:"BUY",buyer:{confidence:76,reason:"Breakout on news rumor."},seller:null,judge:{verdict:"REJECT",reason:"Rumor only, no confirmation."},outcome:{status:"vetoed",would_have_pct:-1.6}},
+ {time:"Yesterday",symbol:"ETH/USDT",side:"BUY",buyer:{confidence:80,reason:"Strong momentum with BTC leading."},seller:{reason:"Fine, but watch the spread."},judge:{verdict:"APPROVE",reason:"Liquid and trending."},outcome:{status:"closed",pnl_pct:1.9,pnl_usdt:3.0}}
+]};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const sgn = n => (n >= 0 ? "+" : "") + n.toFixed(1);
+
+async function load(){
+  try{ const r = await fetch(DATA_URL + "?t=" + Date.now()); if(!r.ok) throw 0; return {d:await r.json(), demo:false}; }
+  catch(e){ return {d:DEMO, demo:true}; }
+}
+
+function render(d, demo){
+  $("demo").style.display = demo ? "block" : "none";
+  const cases = d.cases || [];
+  const closed = cases.filter(c => c.outcome && c.outcome.status === "closed");
+  const wins = closed.filter(c => c.outcome.pnl_pct > 0).length;
+  let streak = 0;
+  for(const c of closed){ if(c.outcome.pnl_pct > 0) streak++; else break; }
+  const vetoes = cases.filter(c => c.judge && c.judge.verdict === "REJECT");
+  const saves = vetoes.filter(c => c.outcome && c.outcome.would_have_pct < 0).length;
+  const pnl = (d.equity / d.start_equity - 1) * 100;
+  const rate = closed.length ? Math.round(wins / closed.length * 100) + "%" : "-";
+
+  $("score").innerHTML =
+    `<div class="stat"><b>${d.equity.toFixed(1)}</b><span>Equity USDT</span></div>
+     <div class="stat"><b class="${pnl >= 0 ? "up" : "down"}">${sgn(pnl)}%</b><span>Total P&amp;L</span></div>
+     <div class="stat"><b>${rate}</b><span>Win rate (${closed.length})</span></div>
+     <div class="stat"><b>🔥 ${streak}</b><span>Win streak</span></div>
+     <div class="stat"><b>🛡️ ${saves}</b><span>Judge saves</span></div>
+     <div class="stat"><b>⚖️ ${vetoes.length}</b><span>Vetoes</span></div>`;
+
+  const k = d.costs, kc = $("costs");
+  if(k){ const nt = k.net_after_all_costs_usdt; kc.style.display = "block";
+    kc.innerHTML = `💸 Running costs: Claude API $${k.api_total_usd.toFixed(2)} · Bitget fees ${k.fees_total_usdt.toFixed(2)} USDT<br><b class="${nt >= 0 ? "up" : "down"}">${k.costs_recovered ? "✅ Costs recovered" : "⏳ Costs not recovered yet"}: net ${(nt >= 0 ? "+" : "") + nt.toFixed(2)} USDT after all costs</b>`;
+  } else { kc.style.display = "none"; }
+  const m = d.mood || {}, n = parseInt(m.fear_greed, 10);
+  const em = isNaN(n) ? "🤔" : n < 25 ? "😱" : n < 45 ? "😟" : n < 55 ? "😐" : n < 75 ? "😀" : "🤑";
+  $("mood").innerHTML = `<div class="e">${em}</div><div><b>Market mood: ${esc(m.fear_greed || "unknown")}</b><br><small>${esc(m.text || "")}</small></div>`;
+
+  const last = cases[0];
+  $("b1").textContent = last && last.buyer ? last.buyer.reason : "Hunting for setups...";
+  $("b2").textContent = last && last.seller ? last.seller.reason : "No objection.";
+  $("b3").textContent = last && last.judge ? (last.judge.verdict === "APPROVE" ? "Approved: " : "Vetoed: ") + last.judge.reason : "Court is in session.";
+
+  $("feed").innerHTML = cases.map(c => {
+    const ok = c.judge.verdict === "APPROVE";
+    return `<div class="case"><div class="stamp ${ok ? "ok" : "no"}">${ok ? "APPROVED" : "VETOED"}</div>
+      <div class="meta">${esc(c.time)} · ${esc(c.side)} ${esc(c.symbol)}</div>
+      ${c.buyer ? `<div class="ln">🐂 <b>Buyer</b> (${esc(c.buyer.confidence)}%): ${esc(c.buyer.reason)}</div>` : ""}
+      ${c.seller ? `<div class="ln">🐻 <b>Seller</b>: ${esc(c.seller.reason)}</div>` : ""}
+      <div class="ln">⚖️ <b>Judge</b>: ${esc(c.judge.reason)}</div></div>`;
+  }).join("") || '<div class="note">No cases yet. The court is empty.</div>';
+
+  $("cards").innerHTML = cases.filter(c => c.judge.verdict === "APPROVE" && c.outcome).map(c => {
+    const o = c.outcome, done = o.status === "closed";
+    const cls = done ? (o.pnl_pct > 0 ? "win" : "loss") : "";
+    return `<div class="tc ${cls}">${done ? `<div class="pop">${o.pnl_pct > 0 ? "🎉" : "💥"}</div>` : ""}
+      <div class="sym">${esc(c.symbol)}</div><div class="st">${done ? "Closed" : "Open now"} · ${esc(c.time)}</div>
+      <div class="pnl ${o.pnl_pct >= 0 ? "up" : "down"}">${sgn(o.pnl_pct)}%</div>
+      <div class="st">${sgn(o.pnl_usdt)} USDT</div></div>`;
+  }).join("") || '<div class="note">No trades yet.</div>';
+
+  const bd = [["🏆 First Win", wins >= 1], ["🔥 5-Win Streak", streak >= 5], ["🛡️ Judge Saved Me", saves >= 1], ["⚖️ Iron Judge (3 vetoes)", vetoes.length >= 3], ["📈 In The Green", pnl > 0]];
+  $("badges").innerHTML = bd.map(b => `<span class="bd ${b[1] ? "" : "lock"}">${b[0]}</span>`).join("");
+}
+
+const go = () => load().then(r => render(r.d, r.demo));
+go(); setInterval(go, 60000);
+</script>
+</body>
+</html>
