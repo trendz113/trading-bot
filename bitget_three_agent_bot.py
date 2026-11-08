@@ -160,7 +160,8 @@ BUYER and SELLER. Approve a trade only if it makes sense in the current overall 
 Reject buys in a falling or panicky market, on hype-only pumps, or with weak reasoning. Reject sells
 that look like panic. Also REJECT any buy whose take-profit is below economics.min_take_profit_pct or
 whose reward is under 1.5x its risk. If economics.costs_recovered is false, demand stronger evidence.
-For each BUY you also get the Buyer/Seller debate in "debates". Weigh the strongest points on both
+For each BUY you also get the Buyer/Seller debate in "debates", including buyer_confidence_after (below 60 means the
+Buyer lost the argument). Weigh the strongest points on both
 sides and REJECT if the Seller's main risk was not convincingly answered.
 When unsure, REJECT.
 Reply ONLY with JSON: {"market_mood":"short","verdicts":[{"symbol":"SOL/USDT","side":"BUY or SELL",
@@ -206,10 +207,13 @@ the strongest honest counter-arguments: what could go wrong, which news or marke
 whether it is chasing a move, and whether the take-profit clearly beats economics.breakeven_pct.
 Be concise. Reply ONLY with JSON: {"challenge":"2-3 sentences","biggest_risk":"short","would_you_buy":true}"""
 
-DEBATE_BUYER_SYS = """You are the BUYER. The Seller challenged your trade idea. Answer the specific objections
-honestly and concede valid points. If the objections are fatal, withdraw the idea. You may tighten
-stop_loss_pct and take_profit_pct (keep take_profit_pct at or above economics.min_take_profit_pct).
-Reply ONLY with JSON: {"reply":"2-3 sentences","withdraw":false,"stop_loss_pct":2,"take_profit_pct":4}"""
+DEBATE_BUYER_SYS = """You are the BUYER. The Seller challenged your trade idea. Defend it with the specific data
+(price action, RSI, volume, news, costs) wherever it holds up, and concede only what is truly wrong.
+General market worry (a fearful index, a flat BTC) was already part of your idea, so it is NOT a reason to
+give up. Do not withdraw: the Judge decides. Report your honest confidence after the debate (0-100) and,
+if needed, tighten stop_loss_pct and take_profit_pct (keep take_profit_pct at or above
+economics.min_take_profit_pct).
+Reply ONLY with JSON: {"reply":"2-3 sentences","confidence_after":70,"stop_loss_pct":2,"take_profit_pct":4}"""
 
 
 def debate(b, ctx):
@@ -218,7 +222,7 @@ def debate(b, ctx):
     rp = llm_json(DEBATE_BUYER_SYS, {"proposal": b, "challenge": ch, "context": ctx}, BUYER_MODEL)
     return {"symbol": b["symbol"], "seller_challenge": ch.get("challenge", ""),
             "seller_biggest_risk": ch.get("biggest_risk", ""), "seller_would_buy": ch.get("would_you_buy"),
-            "buyer_reply": rp.get("reply", ""), "withdrawn": bool(rp.get("withdraw")),
+            "buyer_reply": rp.get("reply", ""), "buyer_confidence_after": rp.get("confidence_after"),
             "revised_sl": rp.get("stop_loss_pct"), "revised_tp": rp.get("take_profit_pct")}
 
 
@@ -429,7 +433,7 @@ def judgetest():
     if os.path.exists(marker) and os.getenv("JUDGETEST", "").lower() != "force":
         print("JUDGETEST already done earlier, remove the JUDGETEST variable in Railway")
         return
-    print("JUDGETEST: running the real Buyer, Seller and Judge on test ideas. No orders will be placed.")
+    print("JUDGETEST: running the real Buyer, Seller and Judge on test ideas. The Judge decides every case. No orders will be placed.")
     snap, nws = snapshot(), news()
     reg, eq = regime(snap), equity()
     eco = economics(eq)
@@ -464,13 +468,11 @@ def judgetest():
         prop = dict(symbol=sym, **prop)
         ctx = dict(base, market=market_with(sym, **row))
         t = debate(prop, ctx)
-        if t["withdrawn"]:
-            verdict, why = "REJECT", "The Buyer withdrew after the Seller's challenge."
-        else:
-            out = llm_json(JUDGE_SYS, {**ctx, "buyer_proposals": [prop], "seller_proposals": [], "debates": [t]},
-                           JUDGE_MODEL)
-            v = next((x for x in out.get("verdicts", []) if x.get("symbol") == sym), {})
-            verdict, why = v.get("verdict", "NO ANSWER"), v.get("reason", "the Judge returned nothing usable")
+        out = llm_json(JUDGE_SYS, {**ctx, "buyer_proposals": [prop], "seller_proposals": [], "debates": [t]},
+                       JUDGE_MODEL)
+        v = next((x for x in out.get("verdicts", []) if x.get("symbol") == sym), {})
+        verdict, why = v.get("verdict", "NO ANSWER"), v.get("reason", "the Judge returned nothing usable")
+        print(f"JUDGETEST {name}: Buyer confidence after the debate: {t['buyer_confidence_after']} (started at {prop['confidence']})")
         print(f"JUDGETEST {name}: Seller says: {t['seller_challenge'][:180]}")
         print(f"JUDGETEST {name}: Buyer replies: {t['buyer_reply'][:180]}")
         print(f"JUDGETEST {name}: JUDGE -> {verdict}. {why[:220]}")
@@ -548,11 +550,6 @@ def cycle():
         save_ledger()
         t = debate(b, ctx)
         transcripts.append(t)
-        if t["withdrawn"]:                             # Buyer gave up: no Judge call needed
-            px = next((x["price"] for x in snap if x["symbol"] == b["symbol"]), None)
-            arena.add_case(b["symbol"], "BUY", b.get("confidence"), *court(b, {b["symbol"]: t}), "REJECT",
-                           "The Buyer withdrew after the Seller's challenge.", px)
-            continue
         for k, v in (("stop_loss_pct", t["revised_sl"]), ("take_profit_pct", t["revised_tp"])):
             if isinstance(v, (int, float)):
                 b[k] = v
