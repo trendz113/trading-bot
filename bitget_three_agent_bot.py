@@ -394,6 +394,33 @@ def sell(sym, reason):
     print("SELL", sym, "pnl", round(pnl, 3), "|", reason)
 
 
+def selftest():
+    """One real round trip (about 10 USDT, costs a few cents) through the SAME buy/sell code the bot uses.
+    Proves your Bitget key can trade. Enable with SELFTEST=yes in Railway, then remove the variable."""
+    marker = os.path.join(DATA_DIR, "selftest_done")
+    if os.path.exists(marker) and os.getenv("SELFTEST", "").lower() != "force":
+        print("SELFTEST already done earlier, remove the SELFTEST variable in Railway")
+        return
+    sym = os.getenv("SELFTEST_SYMBOL", "BTC/USDT")
+    usd = float(os.getenv("SELFTEST_USDT", "10"))
+    print(f"SELFTEST: real buy then sell of about {usd} USDT of {sym}")
+    try:
+        buy(sym, usd, 0.05, 0.05, "selftest")
+        if sym not in pos:
+            print("SELFTEST FAILED: the buy did not fill, see messages above")
+            return
+        print("SELFTEST: buy worked, quantity", pos[sym]["qty"])
+        time.sleep(3)
+        sell(sym, "selftest")
+        if sym in pos:
+            print("SELFTEST: the sell did not finish. Check Bitget and sell it by hand if it is still held")
+            return
+        open(marker, "w").write("ok")
+        print("SELFTEST PASSED: your key can buy and sell. Remove the SELFTEST variable now.")
+    except Exception as e:
+        print("SELFTEST FAILED:", repr(e))
+
+
 def hard_exits():
     """Risk engine: stop-loss, take-profit, time exit. No AI can override this."""
     for sym in list(pos):
@@ -519,6 +546,8 @@ if __name__ == "__main__":
     switch_mode_if_needed()
     init_state()
     filter_universe()
+    if not PAPER and os.getenv("SELFTEST", "").lower() in ("1", "yes", "true", "force"):
+        selftest()
     last_cycle = 0.0
     try:                                               # heartbeat: proves the bot can reach your website repo
         arena.publish(equity(), START_USDT, None, "Bot started, waiting for the first AI cycle", PAPER, None)
