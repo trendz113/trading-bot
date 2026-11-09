@@ -1,5 +1,9 @@
 """
-Bitget spot FAST momentum bot (v5)  -  rule-based scanner + ONE cheap Claude news gate.
+Bitget spot FAST momentum bot (v5.1)  -  rule-based scanner + ONE cheap Claude news gate.
+
+What changed vs v5
+  * UAI CHECK log: every 10 min per extra coin (UAI), the log says exactly which bounce rule is missing
+    (green candle, % off the 15-min low, dumping, RSI, ATR). Skipped targets are also printed.
 
 What changed vs v4
   * WATCHLIST now defaults to ALL (scan the most liquid USDT coins). The old 21-coin list only had 9 coins passing the
@@ -370,6 +374,36 @@ def analyze_bounce(sym, c, force=False):
             "chg_1h_pct": round(r60, 2), "rsi_5m": round(rs, 1), "vol_ratio": 0, "atr_pct": round(a, 2),
             "sl_pct": round(clamp(2.0 * a, 1.5, 4.0), 2), "off_low_pct": round(off_low, 2), "buy_now": bool(force and not ok),
             "spread_pct": round(SPREAD.get(sym, 0), 3)}
+
+
+def bounce_log(sym, c):
+    """Every 10 min: print why an extra coin (UAI) was not bought, so the log shows the missing rule."""
+    if time.time() - LAST.get("bl_" + sym, 0) < 600:
+        return
+    LAST["bl_" + sym] = time.time()
+    if not extra_allowed():
+        print(f"{sym} CHECK: daily extra-coin limit reached (entries {LEDGER.get('extra_entries_today', 0)}/{EXTRA_MAX_ENTRIES}, "
+              f"losses {LEDGER.get('extra_losses_today', 0)}/{EXTRA_MAX_LOSSES})")
+        return
+    if len(c) < 40:
+        print(f"{sym} CHECK: not enough candles ({len(c)})")
+        return
+    cl, op, lo = [x[4] for x in c], [x[1] for x in c], [x[3] for x in c]
+    px, a, rs = cl[-1], atr_pct(c), rsi(cl)
+    off_low = (px / min(lo[-4:]) - 1) * 100
+    fails = []
+    if not cl[-2] > op[-2]:
+        fails.append("last 5m candle is red")
+    if off_low < 0.3:
+        fails.append(f"only {off_low:.2f}% off the 15-min low (needs 0.3%)")
+    if px < cl[-2] * 0.997:
+        fails.append("price is dropping right now")
+    if rs > 70:
+        fails.append(f"RSI {rs:.0f} above 70")
+    if not 0.3 <= a <= 4.0:
+        fails.append(f"ATR {a:.2f}% outside 0.3-4%")
+    print(f"{sym} CHECK: " + ("; ".join(fails) if fails else "rules OK") +
+          f" | price {px}, RSI {rs:.0f}, ATR {a:.2f}%, spread {SPREAD.get(sym, 0):.3f}%")
 
 
 def extra_allowed():
@@ -781,6 +815,8 @@ def _scan(A):
             if s in EXTRA_SYMBOLS:                          # extra coins: fast bounce rule only, with its own daily limits
                 force = EXTRA_BUY_NOW and not os.path.exists(buynow_marker(s))
                 c = analyze_bounce(s, cd, force) if extra_allowed() else None
+                if c is None:
+                    bounce_log(s, cd)
                 if force:
                     print(f"EXTRA {s}: buy-now armed, candidate={'yes' if c else 'NO'}, price={PX.get(s)}, spread={SPREAD.get(s, 0):.3f}%")
             else:
@@ -829,6 +865,7 @@ def _scan(A):
     if tp > (MAX_TP_BOUNCE if bounce else MAX_TP) or (tp > 4.5 * pick["atr_pct"] and not pick.get("buy_now")):
         SKIP[pick["symbol"]] = time.time() + 600         # target too far for this coin's real movement
         A["note"] = f'{pick["symbol"]}: needed target {tp}% is too far for its volatility ({pick["atr_pct"]}% ATR), skipped'
+        print(A["note"])
         return
     ok = buy(pick["symbol"], size, sl / 100, tp / 100, f'{reason_text(pick, quota)} SL {sl}% TP {tp}%',
              BOUNCE_POS if bounce else None,
