@@ -1,5 +1,12 @@
 """
-Bitget spot FAST momentum bot (v4)  -  rule-based scanner + ONE cheap Claude news gate.
+Bitget spot FAST momentum bot (v5)  -  rule-based scanner + ONE cheap Claude news gate.
+
+What changed vs v4
+  * WATCHLIST now defaults to ALL (scan the most liquid USDT coins). The old 21-coin list only had 9 coins passing the
+    volume filter, mostly slow majors, so almost nothing qualified. Set WATCHLIST=BTC,ETH,... to use your own list again.
+  * Risk-based sizing: one full stop-loss may cost at most RISK_FRAC (default 0.5) of DAILY_MAX_LOSS_USD, so a single
+    losing trade no longer eats the whole daily cap. Size = min(normal size, cap*RISK_FRAC / (stop% + fees)).
+  * A "SCAN STATUS" line is printed every 30 min (coins scanned, setups found, reason for no trade).
 
 What changed vs v3
   * RESET_DAY=yes clears today's loss counter once (see apply_reset_day). Remove the variable afterwards.
@@ -81,6 +88,7 @@ GATE_MODEL = os.getenv("GATE_MODEL", "claude-haiku-5-5")
 GATE_FAIL_OPEN = envb("GATE_FAIL_OPEN", "true")        # if Claude is down, trade on rules (False = skip)
 PRICE_IN, PRICE_OUT = envf("PRICE_IN", "1.0"), envf("PRICE_OUT", "5.0")
 MAX_API_DAILY = envf("MAX_API_DAILY_USD", "0.50")      # above this the gate is skipped (rules only)
+RISK_FRAC = envf("RISK_FRAC", "0.5")                   # one stop-loss may cost at most this share of DAILY_MAX_LOSS
 BLOCK_LOG_EVERY = 1800                                 # seconds between "entries blocked" log lines
 STABLES = {"USDC", "FDUSD", "TUSD", "USDD", "DAI", "USDP", "PYUSD", "EUR", "EURT", "USD1", "USDE", "BUSD", "USDT",
            "XUSD", "USDX", "AEUR"}
@@ -101,7 +109,7 @@ MAX_TP_BOUNCE = 8.0
 BOUNCE_POS = {"mode": "bounce", "trail_start": 0.012, "trail_gap": 0.008, "stale_band": 0.006, "max_hold_h": 4}
 SPREAD = {}                 # latest spread % per coin
 # The owner's coin list: the bot scans and trades ONLY these (set WATCHLIST=ALL for the broad liquid-coin scan).
-_WL = os.getenv("WATCHLIST", "BTC,ETH,XRP,DOGE,FET,UAI,CP,XAUT,ICNT,BGB,PEPE,FARTCOIN,ASTER,APT,FIL,ARB,OP,SHIB,PENGU,JUP,SEI")
+_WL = os.getenv("WATCHLIST", "ALL")
 WATCH = [] if _WL.strip().upper() == "ALL" else [x.strip().upper().replace("/USDT", "") + "/USDT" for x in _WL.split(",") if x.strip()]
 WATCH_MIN_VOL = envf("WATCH_MIN_VOL_USDT", "1000000")  # looser than the broad scan (3M) because some listed coins are quieter
 WATCH_MAX_SPREAD = envf("WATCH_MAX_SPREAD_PCT", "0.12")
@@ -265,7 +273,7 @@ def print_status():
     """One line at startup so the log shows the day, the timezone and where the loss cap stands."""
     dn = day_net()
     print(f"STATUS: day {LEDGER['day']} (UTC{DAY_TZ_MIN / 60:+.1f}h) | day realized {LEDGER['day_realized']:+.2f} | "
-          f"day net {dn:+.2f} | loss cap -{DAILY_MAX_LOSS:.2f} | entries blocked now: {entry_block() or 'no'}")
+          f"day net {dn:+.2f} | loss cap -{DAILY_MAX_LOSS:.2f} | risk frac {RISK_FRAC} | entries blocked now: {entry_block() or 'no'}")
 
 
 # ---------------------------------------------------------------- indicators
@@ -812,6 +820,10 @@ def _scan(A):
     if not bounce and extra_slot_free():                  # keep cash free so UAI can always be bought
         size = min(size, max(cash - equity() * POS_PCT * EXTRA_SIZE_FACTOR * 1.02, 0))
     sl = pick["sl_pct"]
+    risk_size = DAILY_MAX_LOSS * RISK_FRAC / (sl / 100 + 2 * FEE)      # a full stop-loss must not eat the daily cap
+    if risk_size < size:
+        print(f"SIZE cut for {pick['symbol']}: {size:.0f} -> {risk_size:.0f} USDT (stop {sl}%, cap {DAILY_MAX_LOSS})")
+        size = risk_size
     need = min_tp_pct(size) + pick.get("spread_pct", 0)
     tp = max(need, round(RR * sl, 2))
     if tp > (MAX_TP_BOUNCE if bounce else MAX_TP) or (tp > 4.5 * pick["atr_pct"] and not pick.get("buy_now")):
@@ -853,6 +865,10 @@ def scan_cycle():
         raise
     finally:
         arena.add_activity(A)
+        if time.time() - LAST.get("scan_log_t", 0) >= BLOCK_LOG_EVERY:     # a heartbeat so a quiet log is not a mystery
+            LAST["scan_log_t"] = time.time()
+            print(f"SCAN STATUS: scanned {A.get('scanned', 0)}, setups {A.get('ideas', 0)}, bought {A.get('bought', 0)} | "
+                  f"{A.get('note') or A.get('error') or 'ok'} | day net {day_net():+.2f} of cap -{DAILY_MAX_LOSS:.2f}")
 
 
 def live_extra():
@@ -910,7 +926,7 @@ def selftest():
 # ---------------------------------------------------------------- main
 def main():
     print("PAPER mode" if PAPER else "LIVE mode (REAL MONEY)", "- fast momentum bot starting")
-    print("VERSION fast-v4 | extra coins:", EXTRA_SYMBOLS, "| buy-now:", EXTRA_BUY_NOW, "| Claude veto on extra coins:",
+    print("VERSION fast-v5 | extra coins:", EXTRA_SYMBOLS, "| buy-now:", EXTRA_BUY_NOW, "| Claude veto on extra coins:",
           EXTRA_USE_GATE, "| extra size factor:", EXTRA_SIZE_FACTOR, "| daily loss cap:", DAILY_MAX_LOSS)
     print("WATCHLIST:", ", ".join(x.replace("/USDT", "") for x in WATCH) if WATCH else "ALL liquid coins")
     if not PAPER and not (os.getenv("BITGET_KEY") and os.getenv("BITGET_SECRET") and os.getenv("BITGET_PASSPHRASE")):
