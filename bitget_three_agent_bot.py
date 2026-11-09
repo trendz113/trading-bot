@@ -1,5 +1,10 @@
 """
-Bitget spot FAST momentum bot (v2)  -  rule-based scanner + ONE cheap Claude news gate.
+Bitget spot FAST momentum bot (v4)  -  rule-based scanner + ONE cheap Claude news gate.
+
+What changed vs v3
+  * RESET_DAY=yes clears today's loss counter once (see apply_reset_day). Remove the variable afterwards.
+  * The log now prints WHY new buys are blocked (every 30 min) and a status line at startup, so you do not need
+    to open the arena page to find out.
 
 What changed vs the 3-agent version
   * No Buyer/Seller debate, no Judge. Entries are chosen by a free, rule-based scanner (no API cost).
@@ -20,6 +25,8 @@ Env:    ANTHROPIC_API_KEY (required for the news gate; without it the bot trades
         START_USDT=600  DAILY_TARGET_USD=5  DAILY_STRETCH_USD=10  DAILY_MAX_LOSS_USD=10  POS_PCT=0.45  MAX_POS=2
         GATE_MODEL=claude-haiku-5-5   PRICE_IN / PRICE_OUT (USD per million tokens, default 1.0 / 5.0, conservative)
         DATA_DIR=/data (Railway volume)   GITHUB_TOKEN / GITHUB_REPO / GITHUB_PATH / GITHUB_BRANCH (arena page)
+        DAY_TZ_OFFSET_MIN=330 (IST day). Use 0 for a UTC day. The loss cap counts everything inside this "day".
+        RESET_DAY=yes  clears today's loss counter once per day (remove the variable after the log confirms it)
 """
 import os, re, csv, json, time, requests, ccxt
 from datetime import datetime, timezone, timedelta
@@ -74,6 +81,7 @@ GATE_MODEL = os.getenv("GATE_MODEL", "claude-haiku-5-5")
 GATE_FAIL_OPEN = envb("GATE_FAIL_OPEN", "true")        # if Claude is down, trade on rules (False = skip)
 PRICE_IN, PRICE_OUT = envf("PRICE_IN", "1.0"), envf("PRICE_OUT", "5.0")
 MAX_API_DAILY = envf("MAX_API_DAILY_USD", "0.50")      # above this the gate is skipped (rules only)
+BLOCK_LOG_EVERY = 1800                                 # seconds between "entries blocked" log lines
 STABLES = {"USDC", "FDUSD", "TUSD", "USDD", "DAI", "USDP", "PYUSD", "EUR", "EURT", "USD1", "USDE", "BUSD", "USDT",
            "XUSD", "USDX", "AEUR"}
 
@@ -232,6 +240,32 @@ def costs_block():
     return {"api_total_usd": round(LEDGER["api_total"], 3), "api_today_usd": round(LEDGER["api_today"], 3),
             "fees_total_usdt": round(LEDGER["fees_total"], 3), "net_after_all_costs_usdt": round(net, 2),
             "costs_recovered": net >= 0, "day_net_usdt": round(day_net(), 2)}
+
+
+def apply_reset_day():
+    """RESET_DAY=yes: clear today's loss counter so the daily loss cap starts again from zero.
+    Runs at most once per local day (marker file). Lifetime stats, fees and open positions are untouched.
+    Remove the RESET_DAY variable afterwards."""
+    if os.getenv("RESET_DAY", "").strip().lower() not in ("1", "yes", "true"):
+        return
+    today = str(local_now().date())
+    marker = os.path.join(DATA_DIR, "resetday_" + today)
+    if os.path.exists(marker):
+        print(f"RESET_DAY already applied for {today}. Remove the RESET_DAY variable.")
+        return
+    before = LEDGER.get("day_realized", 0.0)
+    LEDGER.update(day=today, day_realized=0.0, api_today=0.0, loss_streak=0, pause_until=0,
+                  extra_losses_today=0)
+    save_ledger()
+    open(marker, "w").write("ok")
+    print(f"RESET_DAY: today's loss counter cleared (was {before:+.2f} USDT). Remove the RESET_DAY variable now.")
+
+
+def print_status():
+    """One line at startup so the log shows the day, the timezone and where the loss cap stands."""
+    dn = day_net()
+    print(f"STATUS: day {LEDGER['day']} (UTC{DAY_TZ_MIN / 60:+.1f}h) | day realized {LEDGER['day_realized']:+.2f} | "
+          f"day net {dn:+.2f} | loss cap -{DAILY_MAX_LOSS:.2f} | entries blocked now: {entry_block() or 'no'}")
 
 
 # ---------------------------------------------------------------- indicators
@@ -638,7 +672,7 @@ def sell(sym, reason):
     save_state()
     log([datetime.now().isoformat(), sym, "SELL", price, p["qty"], round(pnl, 3), reason, round(cash, 2)])
     arena.close_trade(sym, pnl, pnl / (p["qty"] * p["entry"]) * 100, reason)
-    print("SELL", sym, "pnl", round(pnl, 3), "|", reason)
+    print("SELL", sym, "pnl", round(pnl, 3), "|", reason, f"| day realized {LEDGER['day_realized']:+.2f}")
     return True
 
 
@@ -656,6 +690,8 @@ def hard_exits():
         except Exception as e:
             print("price fetch failed for", sym, repr(e)[:100])
     if FLATTEN_ON_LOSS and day_net() <= -DAILY_MAX_LOSS:
+        print(f"DAILY LOSS CAP hit: day net {day_net():+.2f}, day realized {LEDGER['day_realized']:+.2f}, "
+              f"day {LEDGER['day']}. Flattening.")
         for sym in list(pos):
             sell(sym, "daily_loss_cap")
         return
@@ -710,6 +746,10 @@ def _scan(A):
     block = entry_block()
     if block:
         A["note"] = f"No new buys: {block}"
+        if time.time() - LAST.get("block_log_t", 0) >= BLOCK_LOG_EVERY:      # visible in the Railway log too
+            LAST["block_log_t"] = time.time()
+            print(f"ENTRIES BLOCKED: {block} | day {LEDGER['day']} | day realized {LEDGER['day_realized']:+.2f} | "
+                  f"day net {day_net():+.2f}")
         return
     quota = (DAILY_MIN_TRADES > 0 and LEDGER["entries_today"] < DAILY_MIN_TRADES
              and local_now().hour >= QUOTA_AFTER_HOUR)
@@ -870,7 +910,7 @@ def selftest():
 # ---------------------------------------------------------------- main
 def main():
     print("PAPER mode" if PAPER else "LIVE mode (REAL MONEY)", "- fast momentum bot starting")
-    print("VERSION fast-v3 | extra coins:", EXTRA_SYMBOLS, "| buy-now:", EXTRA_BUY_NOW, "| Claude veto on extra coins:",
+    print("VERSION fast-v4 | extra coins:", EXTRA_SYMBOLS, "| buy-now:", EXTRA_BUY_NOW, "| Claude veto on extra coins:",
           EXTRA_USE_GATE, "| extra size factor:", EXTRA_SIZE_FACTOR, "| daily loss cap:", DAILY_MAX_LOSS)
     print("WATCHLIST:", ", ".join(x.replace("/USDT", "") for x in WATCH) if WATCH else "ALL liquid coins")
     if not PAPER and not (os.getenv("BITGET_KEY") and os.getenv("BITGET_SECRET") and os.getenv("BITGET_PASSPHRASE")):
@@ -892,6 +932,8 @@ def main():
         missing = [x for x in WATCH if x not in (ex.markets or {})]
         print(f"WATCHLIST check: {len(WATCH) - len(missing)}/{len(WATCH)} coins exist on Bitget spot. Not listed:", missing or "none")
     init_state()
+    apply_reset_day()
+    print_status()
     if not PAPER and os.getenv("SELFTEST", "").lower() in ("1", "yes", "true", "force"):
         selftest()
     last_scan = last_pub = 0.0
