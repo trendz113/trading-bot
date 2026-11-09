@@ -86,10 +86,17 @@ EXTRA_SIZE_FACTOR = envf("EXTRA_SIZE_FACTOR", "0.5")   # extra-coin trades use h
 EXTRA_BUY_NOW = envb("EXTRA_BUY_NOW", "true")          # owner's rule: buy the extra coin at the first scan, no waiting (once)
 EXTRA_MAX_ENTRIES = int(envf("EXTRA_MAX_ENTRIES_DAY", "4"))   # at most this many extra-coin entries per day
 EXTRA_MAX_LOSSES = int(envf("EXTRA_MAX_LOSSES_DAY", "2"))     # stop trading the extra coin for the day after this many losing trades
+EXTRA_USE_GATE = envb("EXTRA_USE_GATE", "false")       # owner's rule: Claude may NOT veto the extra coins (set true to allow it)
+EXTRA_WARNED = set()
 EXTRA_COOLDOWN_MIN = 20                                # extra coins can be re-entered sooner than normal ones (45 min)
 MAX_TP_BOUNCE = 8.0
 BOUNCE_POS = {"mode": "bounce", "trail_start": 0.012, "trail_gap": 0.008, "stale_band": 0.006, "max_hold_h": 4}
-SPREAD = {}                 # latest spread % for extra coins
+SPREAD = {}                 # latest spread % per coin
+# The owner's coin list: the bot scans and trades ONLY these (set WATCHLIST=ALL for the broad liquid-coin scan).
+_WL = os.getenv("WATCHLIST", "BTC,ETH,XRP,DOGE,FET,UAI,CP,XAUT,ICNT,BGB,PEPE,FARTCOIN,ASTER,APT,FIL,ARB,OP,SHIB,PENGU,JUP,SEI")
+WATCH = [] if _WL.strip().upper() == "ALL" else [x.strip().upper().replace("/USDT", "") + "/USDT" for x in _WL.split(",") if x.strip()]
+WATCH_MIN_VOL = envf("WATCH_MIN_VOL_USDT", "1000000")  # looser than the broad scan (3M) because some listed coins are quieter
+WATCH_MAX_SPREAD = envf("WATCH_MAX_SPREAD_PCT", "0.12")
 
 DATA_DIR = os.getenv("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -297,7 +304,7 @@ def analyze(sym, c, quota):
     sl = round(clamp(SL_ATR_MULT * a, SL_MIN, SL_MAX), 2)
     return {"symbol": sym, "price": px, "score": round(score, 1), "chg_15m_pct": round(r15, 2),
             "chg_1h_pct": round(r60, 2), "rsi_5m": round(rs, 1), "vol_ratio": round(volr, 2),
-            "atr_pct": round(a, 2), "sl_pct": sl}
+            "atr_pct": round(a, 2), "sl_pct": sl, "spread_pct": round(SPREAD.get(sym, 0), 3)}
 
 
 def analyze_bounce(sym, c, force=False):
@@ -328,39 +335,70 @@ def extra_allowed():
             and LEDGER.get("extra_losses_today", 0) < EXTRA_MAX_LOSSES)
 
 
+def extra_slot_free():
+    """True when an extra coin (UAI) could still be bought: it is not held and its daily limits allow it."""
+    return bool(EXTRA_SYMBOLS) and any(x not in pos for x in EXTRA_SYMBOLS) and extra_allowed()
+
+
+def normal_full():
+    return sum(1 for x in pos if x not in EXTRA_SYMBOLS) >= MAX_POS
+
+
 def buynow_marker(sym):
     return os.path.join(DATA_DIR, "buynow_done_" + sym.replace("/", "_"))
 
 
 # ---------------------------------------------------------------- market data
 def universe():
-    """Most liquid USDT spot coins that are not stablecoins, leveraged tokens, or already pumped."""
+    """Coins to scan. With a WATCHLIST: only those coins (liquidity limits apply). Without: the most liquid USDT coins."""
     tk = ex.fetch_tickers()
-    rows = []
+    rows, why = [], {}
+    vmin, smax, clow = (WATCH_MIN_VOL, WATCH_MAX_SPREAD, -6) if WATCH else (MIN_VOL, MAX_SPREAD_PCT, -2)
     for sym, t in tk.items():
         try:
             base = sym.split("/")[0]
             if not sym.endswith("/USDT") or ":" in sym or base in STABLES or re.search(r"\d+[LS]$", base):
                 continue
+            if WATCH and sym not in WATCH:
+                continue
             if (ex.markets or {}).get(sym, {}).get("active") is False:
+                why[sym] = "not active"
                 continue
             bid, ask, last = t.get("bid"), t.get("ask"), t.get("last")
             vol = float(t.get("quoteVolume") or 0)
-            if not (bid and ask and last) or vol < MIN_VOL:
+            if not (bid and ask and last):
+                why[sym] = "no bid/ask"
+                continue
+            if vol < vmin:
+                why[sym] = f"volume {vol:,.0f} < {vmin:,.0f}"
                 continue
             chg = float(t.get("percentage") or 0)
-            if (ask - bid) / last * 100 > MAX_SPREAD_PCT or chg > MAX_24H or chg < -2:
+            spr = (ask - bid) / last * 100
+            if spr > smax or chg > MAX_24H or chg < clow:
+                why[sym] = f"spread {spr:.3f}% / 24h {chg:+.1f}% outside limits"
                 continue
+            SPREAD[sym] = spr
             PX[sym] = last
             rows.append((vol, sym))
         except Exception:
             continue
+    if WATCH and time.time() - LAST.get("wl_t", 0) > 3600:      # once an hour: which of your coins are being skipped, and why
+        LAST["wl_t"] = time.time()
+        for sym in WATCH:
+            if sym not in tk:
+                why[sym] = "no ticker on Bitget spot"
+        ok = [s for _, s in rows]
+        print(f"WATCHLIST {len(ok)}/{len(WATCH)} scanned. Skipped:", {k: v for k, v in why.items() if k in WATCH} or "none")
     rows.sort(reverse=True)
-    main = [s for _, s in rows[:SCAN_N]]
+    main = [s for _, s in rows[:max(SCAN_N, len(WATCH))]]
     for sym in EXTRA_SYMBOLS:                          # extra coins skip the 24h-change filter, not the liquidity ones
         t = tk.get(sym) or {}
         bid, ask, last = t.get("bid"), t.get("ask"), t.get("last")
         if not (bid and ask and last) or float(t.get("quoteVolume") or 0) < EXTRA_MIN_VOL:
+            if sym not in EXTRA_WARNED:
+                EXTRA_WARNED.add(sym)
+                print(f"EXTRA coin {sym} NOT usable: ticker found={bool(t)}, bid/ask/last ok={bool(bid and ask and last)}, "
+                      f"24h volume={float(t.get('quoteVolume') or 0):,.0f} (needs {EXTRA_MIN_VOL:,.0f})")
             continue
         SPREAD[sym] = (ask - bid) / last * 100
         if SPREAD[sym] > EXTRA_MAX_SPREAD:
@@ -652,7 +690,7 @@ def hard_exits():
 def entry_block():
     if not NEW_ENTRIES:
         return "new entries are switched off"
-    if len(pos) >= MAX_POS:
+    if normal_full() and not extra_slot_free():           # the extra coin (UAI) has its own reserved slot
         return "maximum open positions"
     dn = day_net()
     if dn <= -DAILY_MAX_LOSS:
@@ -688,13 +726,15 @@ def _scan(A):
     syms = universe()
     cands, now = [], time.time()
     for s in syms:
-        if s in pos or COOL.get(s, 0) > now or SKIP.get(s, 0) > now:
+        if s in pos or COOL.get(s, 0) > now or SKIP.get(s, 0) > now or (normal_full() and s not in EXTRA_SYMBOLS):
             continue
         try:
             cd = candles(s)
             if s in EXTRA_SYMBOLS:                          # extra coins: fast bounce rule only, with its own daily limits
                 force = EXTRA_BUY_NOW and not os.path.exists(buynow_marker(s))
                 c = analyze_bounce(s, cd, force) if extra_allowed() else None
+                if force:
+                    print(f"EXTRA {s}: buy-now armed, candidate={'yes' if c else 'NO'}, price={PX.get(s)}, spread={SPREAD.get(s, 0):.3f}%")
             else:
                 c = analyze(s, cd, quota)
             if c:
@@ -709,8 +749,13 @@ def _scan(A):
         return
     A["best"] = {"symbol": cands[0]["symbol"], "confidence": int(clamp(cands[0]["score"], 0, 100))}
     top = cands[:3]
-    A["debated"] = 1 if client else 0
-    pick, why, blocked = gate(top, reg)
+    ex_c = [c for c in cands if c.get("mode") == "bounce"]
+    if ex_c and not EXTRA_USE_GATE:                       # owner's rule: the extra coin is bought without a Claude veto
+        A["debated"] = 0
+        pick, why, blocked = ex_c[0], "owner's rule: extra coin bought without a Claude veto", {}
+    else:
+        A["debated"] = 1 if client else 0
+        pick, why, blocked = gate(top, reg)
     for s, w in blocked.items():                          # show red-flag blocks on the page
         c = next((x for x in top if x["symbol"] == s), None)
         if c:
@@ -724,6 +769,8 @@ def _scan(A):
     bounce = pick.get("mode") == "bounce"
     size = min(cash, equity() * POS_PCT * (AFTER_TARGET_FACTOR if dn >= DAILY_TARGET else 1)
                * (EXTRA_SIZE_FACTOR if bounce else 1))
+    if not bounce and extra_slot_free():                  # keep cash free so UAI can always be bought
+        size = min(size, max(cash - equity() * POS_PCT * EXTRA_SIZE_FACTOR * 1.02, 0))
     sl = pick["sl_pct"]
     need = min_tp_pct(size) + pick.get("spread_pct", 0)
     tp = max(need, round(RR * sl, 2))
@@ -732,7 +779,8 @@ def _scan(A):
         A["note"] = f'{pick["symbol"]}: needed target {tp}% is too far for its volatility ({pick["atr_pct"]}% ATR), skipped'
         return
     ok = buy(pick["symbol"], size, sl / 100, tp / 100, f'{reason_text(pick, quota)} SL {sl}% TP {tp}%',
-             BOUNCE_POS if bounce else None, EXTRA_MAX_SPREAD if bounce else None)
+             BOUNCE_POS if bounce else None,
+             EXTRA_MAX_SPREAD if bounce else (WATCH_MAX_SPREAD if WATCH else None))
     if not ok:
         SKIP[pick["symbol"]] = time.time() + 300
     if ok:
@@ -822,6 +870,9 @@ def selftest():
 # ---------------------------------------------------------------- main
 def main():
     print("PAPER mode" if PAPER else "LIVE mode (REAL MONEY)", "- fast momentum bot starting")
+    print("VERSION fast-v3 | extra coins:", EXTRA_SYMBOLS, "| buy-now:", EXTRA_BUY_NOW, "| Claude veto on extra coins:",
+          EXTRA_USE_GATE, "| extra size factor:", EXTRA_SIZE_FACTOR, "| daily loss cap:", DAILY_MAX_LOSS)
+    print("WATCHLIST:", ", ".join(x.replace("/USDT", "") for x in WATCH) if WATCH else "ALL liquid coins")
     if not PAPER and not (os.getenv("BITGET_KEY") and os.getenv("BITGET_SECRET") and os.getenv("BITGET_PASSPHRASE")):
         raise SystemExit("LIVE mode needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
     if client is None:
@@ -837,6 +888,9 @@ def main():
         ex.load_markets()
     except Exception as e:
         print("load_markets failed:", repr(e)[:150])
+    if WATCH:
+        missing = [x for x in WATCH if x not in (ex.markets or {})]
+        print(f"WATCHLIST check: {len(WATCH) - len(missing)}/{len(WATCH)} coins exist on Bitget spot. Not listed:", missing or "none")
     init_state()
     if not PAPER and os.getenv("SELFTEST", "").lower() in ("1", "yes", "true", "force"):
         selftest()
