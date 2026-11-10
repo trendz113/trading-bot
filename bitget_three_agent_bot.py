@@ -2,10 +2,11 @@
 bitget_three_agent_bot.py  (single-coin RSI bot for Bitget SPOT; same file name as before so Railway needs no change)
 Trades ONLY the coin in SYMBOL (default UAI/USDT). Never scans or touches other coins.
 
-Strategy (mean reversion):
+Strategy (mean reversion, $ target per trade):
   ENTRY : RSI was <= RSI_OVERSOLD on the previous closed candle and has now crossed back above it
           (+ optional trend filter, spread check)
-  EXIT  : RSI >= RSI_EXIT, or stop-loss, or take-profit
+  BUY   : limit order at the best ask, using the whole balance
+  EXIT  : a resting limit sell on Bitget at the +TARGET_PROFIT_USD price, or the stop-loss (bot-side)
 
 Safety: paper mode by default, daily loss cap, pause after consecutive losses, state saved to disk.
 
@@ -17,10 +18,14 @@ Environment variables (set these in Railway; same names as your old bot):
   TIMEFRAME=15m
   RSI_PERIOD=14
   RSI_OVERSOLD=30
-  RSI_EXIT=55
-  STOP_LOSS_PCT=1.5
-  TAKE_PROFIT_PCT=3.0
-  TRADE_SIZE_USDT=60
+  RSI_EXIT=0           -> 0 = off (default): a trade ends at the $ target or the stop-loss
+  TARGET_PROFIT_USD=10 -> net profit wanted per trade after fees; the exact sell price is calculated for you
+  MAX_LOSS_USD=5       -> stop-loss: about this much lost per trade
+  TRADE_SIZE_USDT=ALL  -> ALL = the whole free USDT balance on every trade (or a number like 300)
+  MAX_TRADE_USDT=0     -> optional cap on one trade when TRADE_SIZE_USDT=ALL (0 = no cap)
+  BUY_LIMIT_OFFSET_PCT=0 -> buy limit order this % below the best ask (0 = at the ask, fills fast)
+  LIMIT_WAIT_SEC=8     -> a buy limit that is not filled in this time is cancelled
+  START_USDT=289       -> your balance now, only used for the equity shown on the arena page
   DAILY_LOSS_CAP=10
   MAX_SPREAD_PCT=0.15
   TREND_FILTER=false   -> if true, buy only when 1h close > 1h EMA50
@@ -40,7 +45,7 @@ import ccxt
 try:
     import arena_feed as arena          # your existing file, keep it next to this one
 except ImportError:
-    print("WARNING: arena_feed.py not found next to rsi_bot.py, the website page will not update")
+    print("WARNING: arena_feed.py not found next to this file, the website page will not update")
 
     class _NoArena:
         def __getattr__(self, name):
@@ -54,15 +59,22 @@ if _paper is not None:
     LIVE = _paper.strip().lower() in ("false", "0", "off", "no")
 else:
     LIVE = os.getenv("LIVE", "false").lower() == "true"
-SYMBOL = os.getenv("SYMBOL", "UAI/USDT").upper()
+SYMBOL = os.getenv("SYMBOL", "UAI/USDT").strip().upper()
+if "/" not in SYMBOL:                       # SYMBOL=UAI is accepted and means UAI/USDT
+    SYMBOL += "/USDT"
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
-RSI_EXIT = float(os.getenv("RSI_EXIT", "55"))
-STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "1.5"))
-TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "3.0"))
-TRADE_SIZE_USDT = float(os.getenv("TRADE_SIZE_USDT", "60"))
-DAILY_LOSS_CAP = float(os.getenv("DAILY_LOSS_CAP", "10"))
+RSI_EXIT = float(os.getenv("RSI_EXIT", "0"))                # 0 = off: trades end at the $ target or the stop-loss
+TARGET_PROFIT_USD = float(os.getenv("TARGET_PROFIT_USD", "10"))   # net profit wanted per trade, after fees
+MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "5"))              # stop-loss: about this much lost per trade
+_size = os.getenv("TRADE_SIZE_USDT", "ALL").strip().upper()
+TRADE_SIZE_ALL = _size == "ALL"                                    # ALL = whole free USDT balance on every trade
+TRADE_SIZE_USDT = 0.0 if TRADE_SIZE_ALL else float(_size)
+MAX_TRADE_USDT = float(os.getenv("MAX_TRADE_USDT", "0"))           # optional cap on a trade (0 = no cap)
+BUY_LIMIT_OFFSET_PCT = float(os.getenv("BUY_LIMIT_OFFSET_PCT", "0"))  # buy limit this % below the best ask (0 = at ask)
+LIMIT_WAIT_SEC = int(os.getenv("LIMIT_WAIT_SEC", "8"))             # cancel the buy limit if not filled in this time
+DAILY_LOSS_CAP = float(os.getenv("DAILY_LOSS_CAP") or os.getenv("DAILY_MAX_LOSS_USD") or "10")   # your old variable works too
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 TREND_FILTER = os.getenv("TREND_FILTER", "false").lower() == "true"
 FEE_PCT = float(os.getenv("FEE_PCT", "0.1"))
@@ -128,7 +140,7 @@ def default_state():
         "loss_streak": 0,
         "pause_until": 0,
         "last_signal_candle": 0,  # candle timestamp we already acted on
-        "paper_cash": 300.0,
+        "paper_cash": START_USDT,
         "total_pnl": 0.0,         # lifetime net P&L of this bot, feeds the equity on the page
         "wins": 0,
         "losses": 0,
@@ -201,16 +213,24 @@ def get_price(ex):
         return _direct_ticker()[0]
 
 
-def spread_pct(ex):
+def best_bid_ask(ex):
     try:
         ob = ex.fetch_order_book(SYMBOL, limit=5)
         if not ob["bids"] or not ob["asks"]:
-            return 999
-        bid, ask = ob["bids"][0][0], ob["asks"][0][0]
+            raise ValueError("empty order book")
+        return ob["bids"][0][0], ob["asks"][0][0]
     except ccxt.ExchangeError as e:
         if not _is_40084(e):
             raise
         _, bid, ask = _direct_ticker()
+        return bid, ask
+
+
+def spread_pct(ex):
+    try:
+        bid, ask = best_bid_ask(ex)
+    except ValueError:
+        return 999
     return (ask - bid) / ask * 100
 
 
@@ -245,62 +265,94 @@ def base_free(ex):
     return float((ex.fetch_balance().get(base) or {}).get("free") or 0)
 
 
+def targets(cost, amount):
+    """Exact sell prices: a take-profit nets TARGET_PROFIT_USD and a stop-loss loses about MAX_LOSS_USD,
+    both after the sell-side fee (the buy-side fee is already inside cost)."""
+    k = amount * (1 - FEE_PCT / 100)
+    tp = (cost + TARGET_PROFIT_USD) / k
+    sl = max((cost - MAX_LOSS_USD) / k, 0.0)
+    return tp, sl
+
+
+def ensure_targets(pos):
+    """Positions saved by an older version get their target prices filled in."""
+    if "tp_price" not in pos or "sl_price" not in pos:
+        pos["tp_price"], pos["sl_price"] = targets(pos["cost"], pos["amount"])
+        pos.setdefault("tp_order", None)
+
+
 def buy(ex, st, price):
+    base = SYMBOL.split("/")[0]
     if LIVE:
-        usdt_free = float((ex.fetch_balance().get("USDT") or {}).get("free") or 0)
-        if usdt_free < TRADE_SIZE_USDT:
-            log.info(f"not enough free USDT to trade ({usdt_free:.2f} < {TRADE_SIZE_USDT})")
+        bal = ex.fetch_balance()
+        usdt_free = float((bal.get("USDT") or {}).get("free") or 0)
+        size = usdt_free * 0.995 if TRADE_SIZE_ALL else TRADE_SIZE_USDT      # whole balance by default
+        if MAX_TRADE_USDT > 0:
+            size = min(size, MAX_TRADE_USDT)
+        if size > usdt_free * 0.995 or size < 10:
+            log.info(f"not enough free USDT to trade (free {usdt_free:.2f}, wanted {size:.2f})")
             return False
-        before = base_free(ex)              # coins you already hold are never counted as this trade
-        order = ex.create_market_buy_order(SYMBOL, TRADE_SIZE_USDT)
-        filled, avg = 0.0, price
-        for _ in range(5):
+        before = float((bal.get(base) or {}).get("free") or 0)               # coins you already hold stay untouched
+        bid, ask = best_bid_ask(ex)
+        limit = float(ex.price_to_precision(SYMBOL, ask * (1 - BUY_LIMIT_OFFSET_PCT / 100)))
+        qty = float(ex.amount_to_precision(SYMBOL, size / limit))
+        order = ex.create_limit_buy_order(SYMBOL, qty, limit)
+        o = order
+        deadline = time.time() + LIMIT_WAIT_SEC
+        while time.time() < deadline:
+            time.sleep(2)
+            o = ex.fetch_order(order["id"], SYMBOL)
+            if o.get("status") == "closed":
+                break
+        if o.get("status") != "closed":                                      # limit not filled in time: cancel the rest
+            try:
+                ex.cancel_order(order["id"], SYMBOL)
+            except Exception as e:
+                log.info(f"cancel: {e!r}"[:200])
             time.sleep(1.5)
             o = ex.fetch_order(order["id"], SYMBOL)
-            filled = float(o.get("filled") or 0)
-            avg = float(o.get("average") or price)
-            if o.get("status") == "closed" and filled > 0:
-                break
-        gained = max(base_free(ex) - before, 0.0)
+        filled = float(o.get("filled") or 0)
+        avg = float(o.get("average") or limit)
+        bal2 = ex.fetch_balance()
+        gained = max(float((bal2.get(base) or {}).get("free") or 0) - before, 0.0)
         amount = min(filled, gained) if filled > 0 else gained
         amount = float(ex.amount_to_precision(SYMBOL, amount))
         if amount <= 0:
-            log.info(f"BUY order {order['id']} shows no filled coins, not tracking a position. Check Bitget.")
+            log.info(f"BUY limit {limit} was not filled within {LIMIT_WAIT_SEC}s and was cancelled. No position.")
             return False
-        cost = avg * amount
+        spent = usdt_free - float((bal2.get("USDT") or {}).get("free") or 0)
+        cost = spent if spent > 0 else avg * amount                          # real USDT spent, fee included
         entry = avg
     else:
-        if st["paper_cash"] < TRADE_SIZE_USDT:
-            log.info("PAPER: not enough paper cash")
+        cash = st["paper_cash"]
+        size = cash if TRADE_SIZE_ALL else TRADE_SIZE_USDT
+        if MAX_TRADE_USDT > 0:
+            size = min(size, MAX_TRADE_USDT)
+        if size > cash or size < 10:
+            log.info(f"PAPER: not enough paper cash ({cash:.2f})")
             return False
-        amount = (TRADE_SIZE_USDT * (1 - FEE_PCT / 100)) / price
-        cost = TRADE_SIZE_USDT
+        amount = (size * (1 - FEE_PCT / 100)) / price
+        cost = size
         entry = price
-        st["paper_cash"] -= TRADE_SIZE_USDT
-    st["position"] = {"entry": entry, "amount": amount, "cost": cost,
-                      "time": datetime.now(IST).isoformat()}
+        st["paper_cash"] -= size
+    tp, sl = targets(cost, amount)
+    tp_order = None
+    if LIVE:                                                                  # resting limit sell at the $ target
+        try:
+            tp = float(ex.price_to_precision(SYMBOL, tp))
+            tp_order = ex.create_limit_sell_order(SYMBOL, amount, tp)["id"]
+        except Exception as e:
+            log.info(f"could not place the resting take-profit order ({e!r}), "
+                     f"the bot will sell at the target price itself"[:300])
+    st["position"] = {"entry": entry, "amount": amount, "cost": cost, "time": datetime.now(IST).isoformat(),
+                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order}
     save_state(st)
     return True
 
 
-def sell(ex, st, price, reason):
-    pos = st["position"]
-    if LIVE:
-        amount = float(ex.amount_to_precision(SYMBOL, min(pos["amount"], base_free(ex))))
-        if amount <= 0:
-            log.info("SELL skipped: no coins on Bitget for the tracked position, clearing it")
-            st["position"] = None
-            save_state(st)
-            arena.close_trade(SYMBOL, 0, 0, "position_missing")
-            return
-        order = ex.create_market_sell_order(SYMBOL, amount)
-        time.sleep(1.5)
-        order = ex.fetch_order(order["id"], SYMBOL)
-        avg = float(order.get("average") or price)
-        proceeds = avg * float(order.get("filled") or amount) * (1 - FEE_PCT / 100)
-    else:
-        proceeds = pos["amount"] * price * (1 - FEE_PCT / 100)
-        st["paper_cash"] += proceeds
+def record_sell(st, pos, proceeds, reason):
+    """Books a finished trade (proceeds = USDT received after the sell fee)."""
+    proceeds += pos.get("banked", 0.0)       # part of the target order that already filled before an early exit
     pnl = proceeds - pos["cost"]
     st["day_pnl"] += pnl
     st["loss_streak"] = st["loss_streak"] + 1 if pnl < 0 else 0
@@ -319,7 +371,54 @@ def sell(ex, st, price, reason):
     log.info(f"SELL {SYMBOL} pnl {pnl:.2f} | {reason} | day pnl {st['day_pnl']:.2f}")
 
 
+def sell(ex, st, price, reason):
+    """Exit now. Live: the resting take-profit order is cancelled first, then the coins are sold at market."""
+    pos = st["position"]
+    if LIVE:
+        if pos.get("tp_order"):
+            try:
+                ex.cancel_order(pos["tp_order"], SYMBOL)
+            except Exception as e:
+                log.info(f"cancel take-profit order: {e!r}"[:200])
+            time.sleep(1)
+            o = ex.fetch_order(pos["tp_order"], SYMBOL)
+            got = float(o.get("filled") or 0)
+            part = float(o.get("average") or pos["tp_price"]) * got * (1 - FEE_PCT / 100)
+            if got > 0 and o.get("status") == "closed":                      # it filled just before the cancel
+                record_sell(st, pos, part, "take_profit (limit order filled)")
+                return
+            if got > 0:                                                      # partly filled: bank it, sell the rest
+                pos["banked"] = pos.get("banked", 0.0) + part
+                pos["amount"] -= got
+            pos["tp_order"] = None
+            save_state(st)
+        amount = float(ex.amount_to_precision(SYMBOL, min(pos["amount"], base_free(ex))))
+        if amount <= 0:
+            log.info("SELL skipped: no coins on Bitget for the tracked position, clearing it")
+            st["position"] = None
+            save_state(st)
+            arena.close_trade(SYMBOL, 0, 0, "position_missing")
+            return
+        order = ex.create_market_sell_order(SYMBOL, amount)
+        time.sleep(1.5)
+        order = ex.fetch_order(order["id"], SYMBOL)
+        avg = float(order.get("average") or price)
+        proceeds = avg * float(order.get("filled") or amount) * (1 - FEE_PCT / 100)
+    else:
+        proceeds = pos["amount"] * price * (1 - FEE_PCT / 100)
+        st["paper_cash"] += proceeds
+    record_sell(st, pos, proceeds, reason)
+
+
 # ---------------- website (arena page) ----------------
+def tp_pct(p):
+    return (p["tp_price"] / p["entry"] - 1) * 100
+
+
+def sl_pct(p):
+    return (1 - p["sl_price"] / p["entry"]) * 100
+
+
 def equity_now(st, price):
     p = st["position"]
     unreal = p["amount"] * price * (1 - FEE_PCT / 100) - p["cost"] if p else 0.0
@@ -330,8 +429,9 @@ def arena_buy(st, prev_r, cur_r, sp):
     p = st["position"]
     conf = int(max(40, min(95, 100 - prev_r)))
     reason = (f"RSI rule: RSI({RSI_PERIOD}) on {TIMEFRAME} crossed up through {RSI_OVERSOLD} "
-              f"({prev_r:.1f} -> {cur_r:.1f}), spread {sp:.3f}%. SL {STOP_LOSS_PCT}% TP {TAKE_PROFIT_PCT}%, "
-              f"exit at RSI {RSI_EXIT}.")
+              f"({prev_r:.1f} -> {cur_r:.1f}), spread {sp:.3f}%. Size {p['cost']:.2f} USDT. "
+              f"Target +{TARGET_PROFIT_USD:g} USDT net at {p['tp_price']:.6g} ({tp_pct(p):.2f}%), "
+              f"stop at {p['sl_price']:.6g} (-{sl_pct(p):.2f}%, about -{MAX_LOSS_USD:g} USDT).")
     arena.add_case(SYMBOL, "BUY", conf, reason, None, "APPROVE",
                    "Rule-based bot, no AI veto on this coin", p["entry"], p["cost"])
 
@@ -342,11 +442,13 @@ def publish(st, price, force=False):
     day_net = st["day_pnl"] + unreal
     positions = []
     if p:
+        ensure_targets(p)
         held = (datetime.now(IST) - datetime.fromisoformat(p["time"])).total_seconds() / 60
         positions.append({"symbol": SYMBOL, "entry": p["entry"], "price": price,
                           "pnl_pct": round((price / p["entry"] - 1) * 100, 2), "held_min": int(held),
-                          "sl_pct": STOP_LOSS_PCT, "tp_pct": TAKE_PROFIT_PCT})
-        note = f"Holding {SYMBOL}: exit at RSI {RSI_EXIT}, stop {STOP_LOSS_PCT}%, target {TAKE_PROFIT_PCT}%"
+                          "sl_pct": round(sl_pct(p), 2), "tp_pct": round(tp_pct(p), 2)})
+        note = (f"Holding {SYMBOL}: target +{TARGET_PROFIT_USD:g} USDT at {p['tp_price']:.6g}, "
+                f"stop at {p['sl_price']:.6g}")
     elif st["day_pnl"] <= -DAILY_LOSS_CAP:
         note = f"No new buys: daily loss cap reached ({st['day_pnl']:+.2f} USDT)"
     elif time.time() < st["pause_until"]:
@@ -379,9 +481,13 @@ def main():
     ex = make_exchange()
     st = load_state()
     mode = "LIVE (REAL MONEY)" if LIVE else "PAPER"
-    log.info(f"{mode} | RSI bot | ONLY coin: {SYMBOL} | {TIMEFRAME} RSI({RSI_PERIOD}) "
-             f"buy cross-up {RSI_OVERSOLD} exit {RSI_EXIT} | SL {STOP_LOSS_PCT}% TP {TAKE_PROFIT_PCT}% "
-             f"| size {TRADE_SIZE_USDT} | daily cap {DAILY_LOSS_CAP} | trend filter {TREND_FILTER}")
+    size_txt = "WHOLE free USDT balance" if TRADE_SIZE_ALL else f"{TRADE_SIZE_USDT:g} USDT"
+    need_pct = (TARGET_PROFIT_USD / max(START_USDT, 1) + 2 * FEE_PCT / 100) * 100
+    log.info(f"{mode} | RSI bot | ONLY coin: {SYMBOL} | {TIMEFRAME} RSI({RSI_PERIOD}) buy on cross-up of {RSI_OVERSOLD} "
+             f"| per trade: size {size_txt}, target +{TARGET_PROFIT_USD:g} USDT net, stop about -{MAX_LOSS_USD:g} USDT "
+             f"| daily loss cap {DAILY_LOSS_CAP:g} | trend filter {TREND_FILTER}")
+    log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
+             f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
 
     last_status = 0
@@ -399,16 +505,29 @@ def main():
             # ---------- manage open position ----------
             pos = st["position"]
             if pos:
+                ensure_targets(pos)
                 chg = (price - pos["entry"]) / pos["entry"] * 100
-                if chg <= -STOP_LOSS_PCT:
-                    sell(ex, st, price, f"stop_loss ({chg:.2f}%)")
-                elif chg >= TAKE_PROFIT_PCT:
-                    sell(ex, st, price, f"take_profit ({chg:.2f}%)")
-                else:
-                    candles = get_closed_candles(ex, TIMEFRAME)
-                    r = rsi_series([c[4] for c in candles], RSI_PERIOD)[-1]
-                    if r is not None and r >= RSI_EXIT:
-                        sell(ex, st, price, f"rsi_exit (RSI {r:.1f}, {chg:.2f}%)")
+                if LIVE and pos.get("tp_order"):                 # has the resting $ target order filled on Bitget?
+                    o = ex.fetch_order(pos["tp_order"], SYMBOL)
+                    if o.get("status") == "closed" and float(o.get("filled") or 0) > 0:
+                        proceeds = (float(o.get("average") or pos["tp_price"]) * float(o["filled"])
+                                    * (1 - FEE_PCT / 100))
+                        record_sell(st, pos, proceeds, "take_profit (limit order filled)")
+                        pos = None
+                    elif o.get("status") in ("canceled", "cancelled", "expired", "rejected"):
+                        log.info("the resting take-profit order is gone, the bot will watch the target itself")
+                        pos["tp_order"] = None
+                        save_state(st)
+                if pos:
+                    if price <= pos["sl_price"]:
+                        sell(ex, st, price, f"stop_loss ({chg:.2f}%)")
+                    elif not pos.get("tp_order") and price >= pos["tp_price"]:
+                        sell(ex, st, price if LIVE else pos["tp_price"], f"take_profit ({chg:.2f}%)")
+                    elif RSI_EXIT > 0:
+                        candles = get_closed_candles(ex, TIMEFRAME)
+                        r = rsi_series([c[4] for c in candles], RSI_PERIOD)[-1]
+                        if r is not None and r >= RSI_EXIT:
+                            sell(ex, st, price, f"rsi_exit (RSI {r:.1f}, {chg:.2f}%)")
 
             # ---------- look for entry ----------
             else:
@@ -438,9 +557,12 @@ def main():
                             log.info("RSI signal skipped: 1h trend filter says down")
                         elif buy(ex, st, price):
                             arena_buy(st, prev_r, cur_r, sp)
-                            log.info(f"BUY {SYMBOL} {price} size {TRADE_SIZE_USDT} | RSI crossed up "
+                            p = st["position"]
+                            log.info(f"BUY {SYMBOL} {p['entry']:.6g} size {p['cost']:.2f} | RSI crossed up "
                                      f"{RSI_OVERSOLD} ({prev_r:.1f} -> {cur_r:.1f}) | spread {sp:.3f}% "
-                                     f"| SL {STOP_LOSS_PCT}% TP {TAKE_PROFIT_PCT}%")
+                                     f"| TARGET {p['tp_price']:.6g} (+{tp_pct(p):.2f}% = +{TARGET_PROFIT_USD:g} USDT net) "
+                                     f"| STOP {p['sl_price']:.6g} (-{sl_pct(p):.2f}%) "
+                                     f"| resting limit sell on Bitget: {'yes' if p.get('tp_order') else 'no'}")
                     elif time.time() - last_status > 600:
                         last_status = time.time()
                         log.info(f"STATUS {SYMBOL} price {price} RSI {cur_r:.1f} | waiting for cross-up "
