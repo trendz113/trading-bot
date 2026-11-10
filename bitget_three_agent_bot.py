@@ -31,9 +31,20 @@ import json
 import time
 import logging
 
-import requestsfrom datetime import datetime, timezone, timedelta
+import requests
+from datetime import datetime, timezone, timedelta
 
 import ccxt
+
+try:
+    import arena_feed as arena          # your existing file, keep it next to rsi_bot.py
+except ImportError:
+    print("WARNING: arena_feed.py not found next to rsi_bot.py, the website page will not update")
+
+    class _NoArena:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+    arena = _NoArena()
 
 # ---------------- config ----------------
 # Same switch as your old bot: PAPER=true (default) or PAPER=false for real money. LIVE=true also works.
