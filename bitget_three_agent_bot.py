@@ -54,6 +54,11 @@ DAILY_LOSS_CAP = float(os.getenv("DAILY_LOSS_CAP", "10"))
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 TREND_FILTER = os.getenv("TREND_FILTER", "false").lower() == "true"
 FEE_PCT = float(os.getenv("FEE_PCT", "0.1"))
+START_USDT = float(os.getenv("START_USDT", "300"))          # baseline for the equity shown on the arena page
+DAILY_TARGET = float(os.getenv("DAILY_TARGET_USD", "1"))    # shown on the page only, not enforced
+DAILY_STRETCH = float(os.getenv("DAILY_STRETCH_USD", "5"))  # shown on the page only, not enforced
+PUBLISH_EVERY = int(os.getenv("PUBLISH_EVERY", "300"))      # seconds between website updates
+LAST = {"rsi": None}
 DATA_DIR = os.getenv("DATA_DIR", ".")   # your Railway volume, e.g. /data
 os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE = os.getenv("STATE_FILE", os.path.join(DATA_DIR, f"rsi_state_{'live' if LIVE else 'paper'}.json"))
@@ -112,6 +117,11 @@ def default_state():
         "pause_until": 0,
         "last_signal_candle": 0,  # candle timestamp we already acted on
         "paper_cash": 300.0,
+        "total_pnl": 0.0,         # lifetime net P&L of this bot, feeds the equity on the page
+        "wins": 0,
+        "losses": 0,
+        "trades": 0,
+        "fees": 0.0,
     }
 
 
@@ -259,9 +269,67 @@ def sell(ex, st, price, reason):
         st["pause_until"] = time.time() + PAUSE_MINUTES * 60
         st["loss_streak"] = 0
         log.info(f"{LOSS_STREAK_LIMIT} losses in a row: no new entries for {PAUSE_MINUTES} min")
+    gross = proceeds / (1 - FEE_PCT / 100)
+    st["total_pnl"] += pnl
+    st["trades"] += 1
+    st["wins" if pnl > 0 else "losses"] += 1
+    st["fees"] += (pos["cost"] + gross) * FEE_PCT / 100
     st["position"] = None
     save_state(st)
+    arena.close_trade(SYMBOL, pnl, pnl / pos["cost"] * 100, reason)
     log.info(f"SELL {SYMBOL} pnl {pnl:.2f} | {reason} | day pnl {st['day_pnl']:.2f}")
+
+
+# ---------------- website (arena page) ----------------
+def equity_now(st, price):
+    p = st["position"]
+    unreal = p["amount"] * price * (1 - FEE_PCT / 100) - p["cost"] if p else 0.0
+    return START_USDT + st["total_pnl"] + unreal, unreal
+
+
+def arena_buy(st, prev_r, cur_r, sp):
+    p = st["position"]
+    conf = int(max(40, min(95, 100 - prev_r)))
+    reason = (f"RSI rule: RSI({RSI_PERIOD}) on {TIMEFRAME} crossed up through {RSI_OVERSOLD} "
+              f"({prev_r:.1f} -> {cur_r:.1f}), spread {sp:.3f}%. SL {STOP_LOSS_PCT}% TP {TAKE_PROFIT_PCT}%, "
+              f"exit at RSI {RSI_EXIT}.")
+    arena.add_case(SYMBOL, "BUY", conf, reason, None, "APPROVE",
+                   "Rule-based bot, no AI veto on this coin", p["entry"], p["cost"])
+
+
+def publish(st, price, force=False):
+    eq, unreal = equity_now(st, price)
+    p = st["position"]
+    day_net = st["day_pnl"] + unreal
+    positions = []
+    if p:
+        held = (datetime.now(IST) - datetime.fromisoformat(p["time"])).total_seconds() / 60
+        positions.append({"symbol": SYMBOL, "entry": p["entry"], "price": price,
+                          "pnl_pct": round((price / p["entry"] - 1) * 100, 2), "held_min": int(held),
+                          "sl_pct": STOP_LOSS_PCT, "tp_pct": TAKE_PROFIT_PCT})
+        note = f"Holding {SYMBOL}: exit at RSI {RSI_EXIT}, stop {STOP_LOSS_PCT}%, target {TAKE_PROFIT_PCT}%"
+    elif st["day_pnl"] <= -DAILY_LOSS_CAP:
+        note = f"No new buys: daily loss cap reached ({st['day_pnl']:+.2f} USDT)"
+    elif time.time() < st["pause_until"]:
+        note = "No new buys: short pause after consecutive losses"
+    else:
+        r = LAST["rsi"]
+        note = (f"Watching {SYMBOL} only: RSI {r:.1f}, buys when it crosses up through {RSI_OVERSOLD}"
+                if r is not None else f"Watching {SYMBOL} only")
+    arena.update_prices({SYMBOL: price})
+    if not force:
+        arena.add_activity({"t": datetime.now(timezone.utc).strftime("%H:%M"), "scanned": 1,
+                            "ideas": 1 if p else 0, "debated": 0, "note": note})
+    costs = {"api_total_usd": 0, "api_today_usd": 0, "fees_total_usdt": round(st["fees"], 3),
+             "net_after_all_costs_usdt": round(eq - START_USDT, 2), "costs_recovered": eq >= START_USDT,
+             "day_net_usdt": round(day_net, 2)}
+    extra = {"positions": positions,
+             "daily": {"net_usdt": round(day_net, 2), "target": DAILY_TARGET, "stretch": DAILY_STRETCH,
+                       "max_loss": DAILY_LOSS_CAP},
+             "stats": {"wins": st["wins"], "losses": st["losses"], "trades": st["trades"]},
+             "next_check_utc": (datetime.now(timezone.utc) + timedelta(seconds=PUBLISH_EVERY)).isoformat()}
+    arena.publish(eq, START_USDT, None, f"Single-coin RSI bot: {SYMBOL}", paper=not LIVE,
+                  costs=costs, extra=extra, force=force)
 
 
 def main():
@@ -274,7 +342,9 @@ def main():
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
 
     last_status = 0
+    last_pub = 0.0
     while True:
+        snap = (bool(st["position"]), st["trades"])
         try:
             # new IST day -> reset daily numbers
             if st["day"] != today_key():
@@ -310,6 +380,7 @@ def main():
                     closes = [c[4] for c in candles]
                     rs = rsi_series(closes, RSI_PERIOD)
                     prev_r, cur_r = rs[-2], rs[-1]
+                    LAST["rsi"] = cur_r
                     candle_ts = candles[-1][0]
 
                     crossed_up = (prev_r is not None and cur_r is not None
@@ -323,6 +394,7 @@ def main():
                         elif not trend_ok(ex):
                             log.info("RSI signal skipped: 1h trend filter says down")
                         elif buy(ex, st, price):
+                            arena_buy(st, prev_r, cur_r, sp)
                             log.info(f"BUY {SYMBOL} {price} size {TRADE_SIZE_USDT} | RSI crossed up "
                                      f"{RSI_OVERSOLD} ({prev_r:.1f} -> {cur_r:.1f}) | spread {sp:.3f}% "
                                      f"| SL {STOP_LOSS_PCT}% TP {TAKE_PROFIT_PCT}%")
@@ -338,6 +410,13 @@ def main():
             log.info(f"network error, retrying: {e}")
         except Exception as e:
             log.info(f"error: {e!r}")
+        try:
+            changed = snap != (bool(st["position"]), st["trades"])
+            if changed or time.time() - last_pub >= PUBLISH_EVERY:
+                last_pub = time.time()
+                publish(st, get_price(ex), force=changed or last_pub == 0)
+        except Exception as e:
+            log.info(f"arena publish error: {e!r}")
         time.sleep(LOOP_SECONDS)
 
 
