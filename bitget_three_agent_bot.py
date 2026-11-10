@@ -1,5 +1,5 @@
 """
-Single-coin RSI bot for Bitget SPOT.
+bitget_three_agent_bot.py  (single-coin RSI bot for Bitget SPOT; same file name as before so Railway needs no change)
 Trades ONLY the coin in SYMBOL (default UAI/USDT). Never scans or touches other coins.
 
 Strategy (mean reversion):
@@ -9,9 +9,10 @@ Strategy (mean reversion):
 
 Safety: paper mode by default, daily loss cap, pause after consecutive losses, state saved to disk.
 
-Environment variables (set these in Railway):
-  BITGET_API_KEY, BITGET_API_SECRET, BITGET_API_PASSPHRASE
-  LIVE=true            -> real money (default false = paper)
+Environment variables (set these in Railway; same names as your old bot):
+  BITGET_KEY, BITGET_SECRET, BITGET_PASSPHRASE
+  PAPER=false          -> real money (PAPER=true or not set = paper)
+  DATA_DIR=/data       -> Railway volume. Keep arena_feed.py in the same folder as this file.
   SYMBOL=UAI/USDT      -> the ONLY coin traded; change this to switch coins
   TIMEFRAME=15m
   RSI_PERIOD=14
@@ -37,7 +38,7 @@ from datetime import datetime, timezone, timedelta
 import ccxt
 
 try:
-    import arena_feed as arena          # your existing file, keep it next to rsi_bot.py
+    import arena_feed as arena          # your existing file, keep it next to this one
 except ImportError:
     print("WARNING: arena_feed.py not found next to rsi_bot.py, the website page will not update")
 
@@ -167,8 +168,14 @@ def make_exchange():
             "createMarketBuyOrderRequiresPrice": False,
         },
     })
-    ex.load_markets()
-    if SYMBOL not in ex.markets:
+    for attempt in range(1, 6):             # a temporary Bitget/network hiccup must not crash the bot
+        try:
+            ex.load_markets()
+            break
+        except Exception as e:
+            log.info(f"load_markets failed (try {attempt}/5): {e!r}"[:300])
+            time.sleep(5)
+    if ex.markets and SYMBOL not in ex.markets:
         raise SystemExit(f"{SYMBOL} not found on Bitget spot. Check the SYMBOL variable.")
     return ex
 
@@ -232,16 +239,34 @@ def trend_ok(ex):
 
 
 # ---------------- trading ----------------
+def base_free(ex):
+    """Free balance of the traded coin (0 if you hold none)."""
+    base = SYMBOL.split("/")[0]
+    return float((ex.fetch_balance().get(base) or {}).get("free") or 0)
+
+
 def buy(ex, st, price):
     if LIVE:
+        usdt_free = float((ex.fetch_balance().get("USDT") or {}).get("free") or 0)
+        if usdt_free < TRADE_SIZE_USDT:
+            log.info(f"not enough free USDT to trade ({usdt_free:.2f} < {TRADE_SIZE_USDT})")
+            return False
+        before = base_free(ex)              # coins you already hold are never counted as this trade
         order = ex.create_market_buy_order(SYMBOL, TRADE_SIZE_USDT)
-        time.sleep(1.5)
-        order = ex.fetch_order(order["id"], SYMBOL)
-        filled = float(order.get("filled") or 0)
-        avg = float(order.get("average") or price)
-        base = SYMBOL.split("/")[0]
-        free = float(ex.fetch_balance()[base]["free"])
-        amount = min(filled, free) if filled else free
+        filled, avg = 0.0, price
+        for _ in range(5):
+            time.sleep(1.5)
+            o = ex.fetch_order(order["id"], SYMBOL)
+            filled = float(o.get("filled") or 0)
+            avg = float(o.get("average") or price)
+            if o.get("status") == "closed" and filled > 0:
+                break
+        gained = max(base_free(ex) - before, 0.0)
+        amount = min(filled, gained) if filled > 0 else gained
+        amount = float(ex.amount_to_precision(SYMBOL, amount))
+        if amount <= 0:
+            log.info(f"BUY order {order['id']} shows no filled coins, not tracking a position. Check Bitget.")
+            return False
         cost = avg * amount
         entry = avg
     else:
@@ -261,10 +286,13 @@ def buy(ex, st, price):
 def sell(ex, st, price, reason):
     pos = st["position"]
     if LIVE:
-        base = SYMBOL.split("/")[0]
-        free = float(ex.fetch_balance()[base]["free"])
-        amount = min(pos["amount"], free)
-        amount = float(ex.amount_to_precision(SYMBOL, amount))
+        amount = float(ex.amount_to_precision(SYMBOL, min(pos["amount"], base_free(ex))))
+        if amount <= 0:
+            log.info("SELL skipped: no coins on Bitget for the tracked position, clearing it")
+            st["position"] = None
+            save_state(st)
+            arena.close_trade(SYMBOL, 0, 0, "position_missing")
+            return
         order = ex.create_market_sell_order(SYMBOL, amount)
         time.sleep(1.5)
         order = ex.fetch_order(order["id"], SYMBOL)
@@ -344,6 +372,10 @@ def publish(st, price, force=False):
 
 
 def main():
+    if LIVE and not ((os.getenv("BITGET_KEY") or os.getenv("BITGET_API_KEY"))
+                     and (os.getenv("BITGET_SECRET") or os.getenv("BITGET_API_SECRET"))
+                     and (os.getenv("BITGET_PASSPHRASE") or os.getenv("BITGET_API_PASSPHRASE"))):
+        raise SystemExit("LIVE mode (PAPER=false) needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
     ex = make_exchange()
     st = load_state()
     mode = "LIVE (REAL MONEY)" if LIVE else "PAPER"
