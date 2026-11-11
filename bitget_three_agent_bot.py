@@ -627,6 +627,7 @@ def main():
     log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
+    log.info(f"SCRIPT VERSION 2026-11-11 (spread retry + optional dip mode) | entry mode: {ENTRY_MODE}")
     if ENTRY_MODE not in ("rsi", "dip"):
         raise SystemExit(f"ENTRY_MODE must be rsi or dip, got {ENTRY_MODE!r}. Stopping.")
     if ENTRY_MODE == "dip":
