@@ -1,6 +1,6 @@
 """
-bitget_three_agent_bot.py  (single-coin RSI bot for Bitget SPOT; same file name as before so Railway needs no change)
-Trades ONLY the coin in SYMBOL (default UAI/USDT). Never scans or touches other coins.
+bitget_three_agent_bot.py  (RSI bot for Bitget SPOT; same file name as before so Railway needs no change)
+Default: trades ONLY the coin in SYMBOL (default UAI/USDT). With ENTRY_MODE=scan it picks the coin itself.
 
 Strategy (mean reversion, $ target per trade):
   ENTRY : RSI was <= RSI_OVERSOLD on the previous closed candle and has now crossed back above it
@@ -14,7 +14,7 @@ Environment variables (set these in Railway; same names as your old bot):
   BITGET_KEY, BITGET_SECRET, BITGET_PASSPHRASE
   PAPER=false          -> real money (PAPER=true or not set = paper)
   DATA_DIR=/data       -> Railway volume. Keep arena_feed.py in the same folder as this file.
-  SYMBOL=UAI/USDT      -> the ONLY coin traded; change this to switch coins
+  SYMBOL=UAI/USDT      -> the ONLY coin traded in rsi/dip mode; change this to switch coins
   TIMEFRAME=15m
   RSI_PERIOD=14
   RSI_OVERSOLD=30
@@ -33,11 +33,23 @@ Environment variables (set these in Railway; same names as your old bot):
   STATE_FILE=state.json  (point to your Railway volume path, e.g. /data/state.json)
 
 Optional dip-buy mode (off by default, so nothing changes unless you set it):
-  ENTRY_MODE=rsi       -> rsi (default, the strategy above) or dip
+  ENTRY_MODE=rsi       -> rsi (default, the strategy above), dip or scan
   DIP_OFFSET_PCT=0.5   -> dip mode: rest a limit buy this % BELOW the current price and wait for the price to come down
   DIP_REPRICE_SEC=900  -> dip mode: if not filled in this time, cancel and place a fresh one below the new price
   In dip mode RSI is not used. After the buy fills, the same take-profit (TARGET_PROFIT_USD),
   stop-loss (MAX_LOSS_USD), daily loss cap and pause rules apply as in rsi mode.
+
+Optional scanner mode (ENTRY_MODE=scan): the bot picks the coin itself instead of trading only SYMBOL.
+  Once per closed candle it looks at the most liquid Bitget USDT coins and buys the biggest-volume coin whose
+  RSI just crossed up through RSI_OVERSOLD and whose spread is <= MAX_SPREAD_PCT (set 0.08 for scanning).
+  One trade at a time, with the same take-profit / stop-loss / daily cap rules as rsi mode.
+  SCAN_TOP_N=30              -> how many coins (biggest 24h volume first) are watched
+  SCAN_MIN_VOLUME_USDT=5000000 -> coins below this 24h traded value are ignored (thin coins)
+  SCAN_MIN_RANGE_PCT=2.5     -> coins whose 24h high-low range is below this are ignored (they cannot reach the target)
+  SCAN_MAX_DAY_MOVE_PCT=20   -> coins that moved more than this % in 24h are ignored (pumps and crashes)
+  SCAN_EXCLUDE=PARTI,UAI     -> optional list of coins never to trade
+  SCAN_DELAY_SEC=3           -> wait this long after a candle closes before scanning
+  SCAN_SIGNAL_MAX_AGE_SEC=300 -> a signal older than this after the candle closed is dropped
 """
 import os
 import json
@@ -89,9 +101,19 @@ START_USDT = float(os.getenv("START_USDT", "300"))          # baseline for the e
 DAILY_TARGET = float(os.getenv("DAILY_TARGET_USD", "1"))    # shown on the page only, not enforced
 DAILY_STRETCH = float(os.getenv("DAILY_STRETCH_USD", "5"))  # shown on the page only, not enforced
 PUBLISH_EVERY = int(os.getenv("PUBLISH_EVERY", "300"))      # seconds between website updates
-ENTRY_MODE = os.getenv("ENTRY_MODE", "rsi").strip().lower()         # rsi (default) or dip
+ENTRY_MODE = os.getenv("ENTRY_MODE", "rsi").strip().lower()         # rsi (default), dip or scan
 DIP_OFFSET_PCT = float(os.getenv("DIP_OFFSET_PCT", "0.5"))          # dip mode: buy limit this % below the price
 DIP_REPRICE_SEC = int(os.getenv("DIP_REPRICE_SEC", "900"))          # dip mode: re-place an unfilled buy after this long
+SCAN_TOP_N = int(os.getenv("SCAN_TOP_N", "30"))                     # scan mode: how many coins are watched
+SCAN_MIN_VOLUME_USDT = float(os.getenv("SCAN_MIN_VOLUME_USDT", "5000000"))   # scan mode: ignore thin coins
+SCAN_MIN_RANGE_PCT = float(os.getenv("SCAN_MIN_RANGE_PCT", "2.5"))  # scan mode: ignore coins that barely move
+SCAN_MAX_DAY_MOVE_PCT = float(os.getenv("SCAN_MAX_DAY_MOVE_PCT", "20"))  # scan mode: ignore pumps and crashes
+SCAN_DELAY_SEC = int(os.getenv("SCAN_DELAY_SEC", "3"))              # scan mode: wait this long after a candle closes
+SCAN_SIGNAL_MAX_AGE_SEC = int(os.getenv("SCAN_SIGNAL_MAX_AGE_SEC", "300"))  # scan mode: drop stale signals
+SCAN_EXCLUDE = {x.strip().upper() for x in os.getenv("SCAN_EXCLUDE", "").split(",") if x.strip()}
+STABLES = {"USDT", "USDC", "USDG", "USDGO", "FDUSD", "TUSD", "DAI", "USDE", "PYUSD", "USD1", "USDP", "EURC",
+           "EURT", "USDD", "BUSD", "GUSD", "FRAX", "LUSD", "USDX", "AEUR"}
+SCAN = {"bucket": None, "cands": [], "tried": set(), "n": 0, "last_status": 0.0}
 LAST = {"rsi": None}
 DATA_DIR = os.getenv("DATA_DIR", ".")   # your Railway volume, e.g. /data
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -104,6 +126,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("rsi-bot")
+
+
+def set_symbol(s):
+    """Scan mode trades a different coin each time, so the active coin is a module-level variable."""
+    global SYMBOL
+    SYMBOL = s
 
 
 # ---------------- indicators ----------------
@@ -144,7 +172,7 @@ def today_key():
 
 def default_state():
     return {
-        "position": None,        # {"entry": price, "amount": coin_qty, "cost": usdt, "time": iso}
+        "position": None,        # {"entry": price, "amount": coin_qty, "cost": usdt, "time": iso, "symbol": ...}
         "day": today_key(),
         "day_pnl": 0.0,
         "loss_streak": 0,
@@ -197,7 +225,7 @@ def make_exchange():
         except Exception as e:
             log.info(f"load_markets failed (try {attempt}/5): {e!r}"[:300])
             time.sleep(5)
-    if ex.markets and SYMBOL not in ex.markets:
+    if ex.markets and SYMBOL not in ex.markets and ENTRY_MODE != "scan":
         raise SystemExit(f"{SYMBOL} not found on Bitget spot. Check the SYMBOL variable.")
     return ex
 
@@ -206,54 +234,58 @@ def _is_40084(e):
     return "40084" in str(e)
 
 
-def _direct_ticker():
+def _direct_ticker(sym=None):
     """Public Bitget spot ticker without ccxt: returns (last, bid, ask)."""
+    sym = sym or SYMBOL
     r = requests.get("https://api.bitget.com/api/v2/spot/market/tickers",
-                     params={"symbol": SYMBOL.replace("/", "")}, timeout=10).json()
+                     params={"symbol": sym.replace("/", "")}, timeout=10).json()
     d = r["data"][0]
     return float(d["lastPr"]), float(d["bidPr"]), float(d["askPr"])
 
 
-def get_price(ex):
+def get_price(ex, sym=None):
+    sym = sym or SYMBOL
     try:
-        return ex.fetch_ticker(SYMBOL)["last"]
+        return ex.fetch_ticker(sym)["last"]
     except ccxt.ExchangeError as e:
         if not _is_40084(e):
             raise
-        return _direct_ticker()[0]
+        return _direct_ticker(sym)[0]
 
 
-def best_bid_ask(ex):
+def best_bid_ask(ex, sym=None):
+    sym = sym or SYMBOL
     try:
-        ob = ex.fetch_order_book(SYMBOL, limit=5)
+        ob = ex.fetch_order_book(sym, limit=5)
         if not ob["bids"] or not ob["asks"]:
             raise ValueError("empty order book")
         return ob["bids"][0][0], ob["asks"][0][0]
     except ccxt.ExchangeError as e:
         if not _is_40084(e):
             raise
-        _, bid, ask = _direct_ticker()
+        _, bid, ask = _direct_ticker(sym)
         return bid, ask
 
 
-def spread_pct(ex):
+def spread_pct(ex, sym=None):
     try:
-        bid, ask = best_bid_ask(ex)
+        bid, ask = best_bid_ask(ex, sym)
     except ValueError:
         return 999
     return (ask - bid) / ask * 100
 
 
-def get_closed_candles(ex, timeframe, limit=150):
+def get_closed_candles(ex, timeframe, limit=150, sym=None):
     """Closed candles only (the last, still-forming candle is dropped)."""
+    sym = sym or SYMBOL
     try:
-        c = ex.fetch_ohlcv(SYMBOL, timeframe, limit=limit)
+        c = ex.fetch_ohlcv(sym, timeframe, limit=limit)
     except ccxt.ExchangeError as e:
         if not _is_40084(e):
             raise
         gran = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h"}[timeframe]
         r = requests.get("https://api.bitget.com/api/v2/spot/market/candles",
-                         params={"symbol": SYMBOL.replace("/", ""), "granularity": gran, "limit": str(limit)},
+                         params={"symbol": sym.replace("/", ""), "granularity": gran, "limit": str(limit)},
                          timeout=10).json()
         rows = sorted(r["data"], key=lambda x: int(x[0]))
         c = [[int(x[0])] + [float(v) for v in x[1:6]] for x in rows]
@@ -355,7 +387,7 @@ def buy(ex, st, price):
             log.info(f"could not place the resting take-profit order ({e!r}), "
                      f"the bot will sell at the target price itself"[:300])
     st["position"] = {"entry": entry, "amount": amount, "cost": cost, "time": datetime.now(IST).isoformat(),
-                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order}
+                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order, "symbol": SYMBOL}
     save_state(st)
     return True
 
@@ -373,7 +405,7 @@ def _open_position(ex, st, entry, amount, cost):
             log.info(f"could not place the resting take-profit order ({e!r}), "
                      f"the bot will sell at the target price itself"[:300])
     st["position"] = {"entry": entry, "amount": amount, "cost": cost, "time": datetime.now(IST).isoformat(),
-                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order}
+                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order, "symbol": SYMBOL}
     st["dip_order"] = None
     save_state(st)
 
@@ -484,6 +516,91 @@ def arena_buy_dip(st):
                    "Rule-based dip buy, no AI veto on this coin", p["entry"], p["cost"])
 
 
+# ---------------- scanner mode (ENTRY_MODE=scan) ----------------
+def scan_universe(ex):
+    """Most liquid Bitget USDT spot coins that pass the volume / range / day-move filters, biggest volume first."""
+    r = requests.get("https://api.bitget.com/api/v2/spot/market/tickers", timeout=15).json()
+    rows = []
+    for d in r.get("data") or []:
+        try:
+            raw = d["symbol"]
+            if not raw.endswith("USDT"):
+                continue
+            base = raw[:-4]
+            sym = f"{base}/USDT"
+            if base in STABLES or base in SCAN_EXCLUDE:
+                continue
+            m = ex.markets.get(sym)
+            if not m or not m.get("active", True) or not m.get("spot", True):
+                continue
+            vol = float(d.get("usdtVolume") or d.get("quoteVolume") or 0)
+            hi, lo = float(d["high24h"]), float(d["low24h"])
+            last, opn = float(d["lastPr"]), float(d["open"])
+            if vol < SCAN_MIN_VOLUME_USDT or lo <= 0 or opn <= 0:
+                continue
+            if (hi - lo) / lo * 100 < SCAN_MIN_RANGE_PCT:
+                continue
+            if abs(last / opn - 1) * 100 > SCAN_MAX_DAY_MOVE_PCT:
+                continue
+            rows.append((sym, vol))
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:SCAN_TOP_N]
+
+
+def scan_refresh(ex):
+    """Once per closed candle: find every watched coin whose RSI just crossed up through RSI_OVERSOLD."""
+    tf_sec = ex.parse_timeframe(TIMEFRAME)
+    now = time.time()
+    bucket = int(now // tf_sec)
+    if bucket == SCAN["bucket"] or now - bucket * tf_sec < SCAN_DELAY_SEC:
+        return
+    SCAN["bucket"], SCAN["tried"], SCAN["cands"] = bucket, set(), []
+    coins = scan_universe(ex)
+    SCAN["n"] = len(coins)
+    for sym, _vol in coins:                                   # already sorted by 24h volume, biggest first
+        try:
+            candles = get_closed_candles(ex, TIMEFRAME, 60, sym)
+            if len(candles) < RSI_PERIOD + 3:
+                continue
+            rs = rsi_series([c[4] for c in candles], RSI_PERIOD)
+            prev_r, cur_r = rs[-2], rs[-1]
+            if prev_r is None or cur_r is None or not (prev_r <= RSI_OVERSOLD < cur_r):
+                continue
+            ts = candles[-1][0]
+            if now - (ts / 1000 + tf_sec) > SCAN_SIGNAL_MAX_AGE_SEC:
+                continue
+            SCAN["cands"].append({"sym": sym, "ts": ts, "prev": prev_r, "cur": cur_r})
+        except Exception as e:
+            log.info(f"scan {sym}: {e!r}"[:200])
+    names = ", ".join(c["sym"] for c in SCAN["cands"]) or "none"
+    log.info(f"SCAN: {SCAN['n']} coins watched, RSI cross-up signals: {names}")
+
+
+def scan_pick(ex, st):
+    """Try the signals (biggest volume first). Returns (prev_r, cur_r, spread) when a position was opened."""
+    scan_refresh(ex)
+    tf_sec = ex.parse_timeframe(TIMEFRAME)
+    for c in list(SCAN["cands"]):
+        if time.time() - (c["ts"] / 1000 + tf_sec) > SCAN_SIGNAL_MAX_AGE_SEC:
+            SCAN["cands"].remove(c)                           # stale: drop it
+            continue
+        if c["sym"] in SCAN["tried"]:
+            continue
+        sp = spread_pct(ex, c["sym"])
+        if sp > MAX_SPREAD_PCT:                               # not tried yet: checked again on the next loop
+            continue
+        SCAN["tried"].add(c["sym"])
+        set_symbol(c["sym"])
+        if not trend_ok(ex):
+            log.info(f"SCAN signal {c['sym']} skipped: 1h trend filter says down")
+            continue
+        if buy(ex, st, get_price(ex)):
+            return c["prev"], c["cur"], sp
+    return None
+
+
 def record_sell(st, pos, proceeds, reason):
     """Books a finished trade (proceeds = USDT received after the sell fee)."""
     proceeds += pos.get("banked", 0.0)       # part of the target order that already filled before an early exit
@@ -555,8 +672,15 @@ def sl_pct(p):
 
 def equity_now(st, price):
     p = st["position"]
-    unreal = p["amount"] * price * (1 - FEE_PCT / 100) - p["cost"] if p else 0.0
+    unreal = p["amount"] * price * (1 - FEE_PCT / 100) - p["cost"] if p and price else 0.0
     return START_USDT + st["total_pnl"] + unreal, unreal
+
+
+def current_price(ex, st):
+    """Scan mode has no coin to price while it is flat."""
+    if st["position"] or ENTRY_MODE != "scan":
+        return get_price(ex)
+    return None
 
 
 def arena_buy(st, prev_r, cur_r, sp):
@@ -566,8 +690,9 @@ def arena_buy(st, prev_r, cur_r, sp):
               f"({prev_r:.1f} -> {cur_r:.1f}), spread {sp:.3f}%. Size {p['cost']:.2f} USDT. "
               f"Target +{TARGET_PROFIT_USD:g} USDT net at {p['tp_price']:.6g} ({tp_pct(p):.2f}%), "
               f"stop at {p['sl_price']:.6g} (-{sl_pct(p):.2f}%, about -{MAX_LOSS_USD:g} USDT).")
-    arena.add_case(SYMBOL, "BUY", conf, reason, None, "APPROVE",
-                   "Rule-based bot, no AI veto on this coin", p["entry"], p["cost"])
+    verdict = "Scanner picked the biggest-volume signal, no AI veto" if ENTRY_MODE == "scan" \
+        else "Rule-based bot, no AI veto on this coin"
+    arena.add_case(SYMBOL, "BUY", conf, reason, None, "APPROVE", verdict, p["entry"], p["cost"])
 
 
 def publish(st, price, force=False):
@@ -587,6 +712,9 @@ def publish(st, price, force=False):
         note = f"No new buys: daily loss cap reached ({st['day_pnl']:+.2f} USDT)"
     elif time.time() < st["pause_until"]:
         note = "No new buys: short pause after consecutive losses"
+    elif ENTRY_MODE == "scan":
+        note = (f"Scan mode: watching the top {SCAN['n'] or SCAN_TOP_N} coins, "
+                f"buys the biggest-volume one whose RSI crosses up through {RSI_OVERSOLD}")
     elif ENTRY_MODE == "dip":
         d = st.get("dip_order")
         note = (f"Dip mode: resting buy limit for {SYMBOL} at {d['price']:.6g} ({DIP_OFFSET_PCT:g}% below the market)"
@@ -595,9 +723,11 @@ def publish(st, price, force=False):
         r = LAST["rsi"]
         note = (f"Watching {SYMBOL} only: RSI {r:.1f}, buys when it crosses up through {RSI_OVERSOLD}"
                 if r is not None else f"Watching {SYMBOL} only")
-    arena.update_prices({SYMBOL: price})
+    if price:
+        arena.update_prices({SYMBOL: price})
     if not force:
-        arena.add_activity({"t": datetime.now(timezone.utc).strftime("%H:%M"), "scanned": 1,
+        arena.add_activity({"t": datetime.now(timezone.utc).strftime("%H:%M"),
+                            "scanned": (SCAN["n"] or 1) if ENTRY_MODE == "scan" else 1,
                             "ideas": 1 if p else 0, "debated": 0, "note": note})
     costs = {"api_total_usd": 0, "api_today_usd": 0, "fees_total_usdt": round(st["fees"], 3),
              "net_after_all_costs_usdt": round(eq - START_USDT, 2), "costs_recovered": eq >= START_USDT,
@@ -607,32 +737,40 @@ def publish(st, price, force=False):
                        "max_loss": DAILY_LOSS_CAP},
              "stats": {"wins": st["wins"], "losses": st["losses"], "trades": st["trades"]},
              "next_check_utc": (datetime.now(timezone.utc) + timedelta(seconds=PUBLISH_EVERY)).isoformat()}
-    arena.publish(eq, START_USDT, None, f"Single-coin RSI bot: {SYMBOL}", paper=not LIVE,
+    title = "Scanner RSI bot: top Bitget coins" if ENTRY_MODE == "scan" else f"Single-coin RSI bot: {SYMBOL}"
+    arena.publish(eq, START_USDT, None, title, paper=not LIVE,
                   costs=costs, extra=extra, force=force)
 
 
 def main():
+    if ENTRY_MODE not in ("rsi", "dip", "scan"):
+        raise SystemExit(f"ENTRY_MODE must be rsi, dip or scan, got {ENTRY_MODE!r}. Stopping.")
     if LIVE and not ((os.getenv("BITGET_KEY") or os.getenv("BITGET_API_KEY"))
                      and (os.getenv("BITGET_SECRET") or os.getenv("BITGET_API_SECRET"))
                      and (os.getenv("BITGET_PASSPHRASE") or os.getenv("BITGET_API_PASSPHRASE"))):
         raise SystemExit("LIVE mode (PAPER=false) needs BITGET_KEY, BITGET_SECRET and BITGET_PASSPHRASE. Stopping.")
     ex = make_exchange()
     st = load_state()
+    if ENTRY_MODE == "scan" and st["position"] and st["position"].get("symbol"):
+        set_symbol(st["position"]["symbol"])                 # a restart must keep managing the coin that was bought
     mode = "LIVE (REAL MONEY)" if LIVE else "PAPER"
     size_txt = "WHOLE free USDT balance" if TRADE_SIZE_ALL else f"{TRADE_SIZE_USDT:g} USDT"
     need_pct = (TARGET_PROFIT_USD / max(START_USDT, 1) + 2 * FEE_PCT / 100) * 100
-    log.info(f"{mode} | RSI bot | ONLY coin: {SYMBOL} | {TIMEFRAME} RSI({RSI_PERIOD}) buy on cross-up of {RSI_OVERSOLD} "
+    coin_txt = f"scanning top {SCAN_TOP_N} coins" if ENTRY_MODE == "scan" else f"ONLY coin: {SYMBOL}"
+    log.info(f"{mode} | RSI bot | {coin_txt} | {TIMEFRAME} RSI({RSI_PERIOD}) buy on cross-up of {RSI_OVERSOLD} "
              f"| per trade: size {size_txt}, target +{TARGET_PROFIT_USD:g} USDT net, stop about -{MAX_LOSS_USD:g} USDT "
              f"| daily loss cap {DAILY_LOSS_CAP:g} | trend filter {TREND_FILTER}")
     log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
-    log.info(f"SCRIPT VERSION 2026-11-11 (spread retry + optional dip mode) | entry mode: {ENTRY_MODE}")
-    if ENTRY_MODE not in ("rsi", "dip"):
-        raise SystemExit(f"ENTRY_MODE must be rsi or dip, got {ENTRY_MODE!r}. Stopping.")
+    log.info(f"SCRIPT VERSION 2026-11-11b (scan mode added) | entry mode: {ENTRY_MODE}")
     if ENTRY_MODE == "dip":
         log.info(f"ENTRY MODE: dip | resting buy limit {DIP_OFFSET_PCT:g}% below the market, "
                  f"re-priced every {DIP_REPRICE_SEC}s | RSI is not used for entries")
+    if ENTRY_MODE == "scan":
+        log.info(f"ENTRY MODE: scan | top {SCAN_TOP_N} coins by 24h volume (min {SCAN_MIN_VOLUME_USDT:g} USDT, "
+                 f"range >= {SCAN_MIN_RANGE_PCT:g}%, day move <= {SCAN_MAX_DAY_MOVE_PCT:g}%), "
+                 f"spread <= {MAX_SPREAD_PCT:g}%, excluded: {sorted(SCAN_EXCLUDE) or 'none'}")
 
     last_status = 0
     last_pub = 0.0
@@ -645,7 +783,7 @@ def main():
                 st["day"], st["day_pnl"], st["loss_streak"] = today_key(), 0.0, 0
                 save_state(st)
 
-            price = get_price(ex)
+            price = current_price(ex, st)
 
             # ---------- manage open position ----------
             pos = st["position"]
@@ -682,7 +820,27 @@ def main():
                 elif time.time() < st["pause_until"]:
                     blocked = "paused after consecutive losses"
 
-                if ENTRY_MODE == "dip":
+                if ENTRY_MODE == "scan":
+                    if blocked:
+                        if time.time() - last_status > 600:
+                            last_status = time.time()
+                            log.info(f"ENTRIES BLOCKED: {blocked}")
+                    else:
+                        hit = scan_pick(ex, st)
+                        if hit:
+                            prev_r, cur_r, sp = hit
+                            arena_buy(st, prev_r, cur_r, sp)
+                            p = st["position"]
+                            log.info(f"BUY {SYMBOL} {p['entry']:.6g} size {p['cost']:.2f} | scanner pick, RSI crossed up "
+                                     f"{RSI_OVERSOLD} ({prev_r:.1f} -> {cur_r:.1f}) | spread {sp:.3f}% "
+                                     f"| TARGET {p['tp_price']:.6g} (+{tp_pct(p):.2f}% = +{TARGET_PROFIT_USD:g} USDT net) "
+                                     f"| STOP {p['sl_price']:.6g} (-{sl_pct(p):.2f}%) "
+                                     f"| resting limit sell on Bitget: {'yes' if p.get('tp_order') else 'no'}")
+                        elif time.time() - last_status > 600:
+                            last_status = time.time()
+                            log.info(f"STATUS scan | {SCAN['n']} coins watched, {len(SCAN['cands'])} signal(s) waiting "
+                                     f"| day pnl {st['day_pnl']:.2f}")
+                elif ENTRY_MODE == "dip":
                     if blocked:
                         if st.get("dip_order") and dip_check(ex, st, price, cancel=True):
                             arena_buy_dip(st)                        # it filled while being cancelled
@@ -750,7 +908,7 @@ def main():
             changed = snap != (bool(st["position"]), st["trades"])
             if changed or time.time() - last_pub >= PUBLISH_EVERY:
                 last_pub = time.time()
-                publish(st, get_price(ex), force=changed or last_pub == 0)
+                publish(st, current_price(ex, st), force=changed or last_pub == 0)
         except Exception as e:
             log.info(f"arena publish error: {e!r}")
         time.sleep(LOOP_SECONDS)
