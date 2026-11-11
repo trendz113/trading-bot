@@ -31,6 +31,13 @@ Environment variables (set these in Railway; same names as your old bot):
   TREND_FILTER=false   -> if true, buy only when 1h close > 1h EMA50
   FEE_PCT=0.1          -> per side, used for P&L math
   STATE_FILE=state.json  (point to your Railway volume path, e.g. /data/state.json)
+
+Optional dip-buy mode (off by default, so nothing changes unless you set it):
+  ENTRY_MODE=rsi       -> rsi (default, the strategy above) or dip
+  DIP_OFFSET_PCT=0.5   -> dip mode: rest a limit buy this % BELOW the current price and wait for the price to come down
+  DIP_REPRICE_SEC=900  -> dip mode: if not filled in this time, cancel and place a fresh one below the new price
+  In dip mode RSI is not used. After the buy fills, the same take-profit (TARGET_PROFIT_USD),
+  stop-loss (MAX_LOSS_USD), daily loss cap and pause rules apply as in rsi mode.
 """
 import os
 import json
@@ -82,6 +89,9 @@ START_USDT = float(os.getenv("START_USDT", "300"))          # baseline for the e
 DAILY_TARGET = float(os.getenv("DAILY_TARGET_USD", "1"))    # shown on the page only, not enforced
 DAILY_STRETCH = float(os.getenv("DAILY_STRETCH_USD", "5"))  # shown on the page only, not enforced
 PUBLISH_EVERY = int(os.getenv("PUBLISH_EVERY", "300"))      # seconds between website updates
+ENTRY_MODE = os.getenv("ENTRY_MODE", "rsi").strip().lower()         # rsi (default) or dip
+DIP_OFFSET_PCT = float(os.getenv("DIP_OFFSET_PCT", "0.5"))          # dip mode: buy limit this % below the price
+DIP_REPRICE_SEC = int(os.getenv("DIP_REPRICE_SEC", "900"))          # dip mode: re-place an unfilled buy after this long
 LAST = {"rsi": None}
 DATA_DIR = os.getenv("DATA_DIR", ".")   # your Railway volume, e.g. /data
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -350,6 +360,130 @@ def buy(ex, st, price):
     return True
 
 
+# ---------------- dip-buy mode (ENTRY_MODE=dip) ----------------
+def _open_position(ex, st, entry, amount, cost):
+    """Common tail of a fill: work out the target prices, rest the take-profit sell on Bitget, save the position."""
+    tp, sl = targets(cost, amount)
+    tp_order = None
+    if LIVE:
+        try:
+            tp = float(ex.price_to_precision(SYMBOL, tp))
+            tp_order = ex.create_limit_sell_order(SYMBOL, amount, tp)["id"]
+        except Exception as e:
+            log.info(f"could not place the resting take-profit order ({e!r}), "
+                     f"the bot will sell at the target price itself"[:300])
+    st["position"] = {"entry": entry, "amount": amount, "cost": cost, "time": datetime.now(IST).isoformat(),
+                      "tp_price": tp, "sl_price": sl, "tp_order": tp_order}
+    st["dip_order"] = None
+    save_state(st)
+
+
+def dip_place(ex, st, price):
+    """Rest a limit buy DIP_OFFSET_PCT below the market and remember it. Returns True if an order is waiting."""
+    limit_raw = price * (1 - DIP_OFFSET_PCT / 100)
+    if LIVE:
+        base = SYMBOL.split("/")[0]
+        bal = ex.fetch_balance()
+        usdt_free = float((bal.get("USDT") or {}).get("free") or 0)
+        size = usdt_free * 0.995 if TRADE_SIZE_ALL else TRADE_SIZE_USDT
+        if MAX_TRADE_USDT > 0:
+            size = min(size, MAX_TRADE_USDT)
+        if size > usdt_free * 0.995 or size < 10:
+            if time.time() - LAST.get("dip_warn", 0) > 600:
+                LAST["dip_warn"] = time.time()
+                log.info(f"not enough free USDT for a dip order (free {usdt_free:.2f}, wanted {size:.2f})")
+            return False
+        limit = float(ex.price_to_precision(SYMBOL, limit_raw))
+        qty = float(ex.amount_to_precision(SYMBOL, size / limit))
+        order = ex.create_limit_buy_order(SYMBOL, qty, limit)
+        st["dip_order"] = {"id": order["id"], "price": limit, "ts": time.time(), "usdt_before": usdt_free,
+                           "base_before": float((bal.get(base) or {}).get("free") or 0)}
+    else:
+        cash = st["paper_cash"]
+        size = cash if TRADE_SIZE_ALL else TRADE_SIZE_USDT
+        if MAX_TRADE_USDT > 0:
+            size = min(size, MAX_TRADE_USDT)
+        if size > cash or size < 10:
+            if time.time() - LAST.get("dip_warn", 0) > 600:
+                LAST["dip_warn"] = time.time()
+                log.info(f"PAPER: not enough paper cash for a dip order ({cash:.2f})")
+            return False
+        limit = limit_raw
+        st["dip_order"] = {"price": limit, "ts": time.time(), "size": size}
+    save_state(st)
+    log.info(f"DIP buy limit placed at {limit:.6g} ({DIP_OFFSET_PCT:g}% below {price:.6g}), waiting for the price to come down")
+    return True
+
+
+def _dip_filled(ex, st, d, o):
+    """The dip order filled (fully or partly): book the position. Returns True if a position is open."""
+    if LIVE:
+        base = SYMBOL.split("/")[0]
+        filled = float(o.get("filled") or 0)
+        avg = float(o.get("average") or d["price"])
+        bal2 = ex.fetch_balance()
+        gained = max(float((bal2.get(base) or {}).get("free") or 0) - d["base_before"], 0.0)
+        amount = float(ex.amount_to_precision(SYMBOL, min(filled, gained) if filled > 0 else gained))
+        if amount <= 0:
+            st["dip_order"] = None
+            save_state(st)
+            return False
+        spent = d["usdt_before"] - float((bal2.get("USDT") or {}).get("free") or 0)
+        cost = spent if spent > 0 else avg * amount                          # real USDT spent, fee included
+        entry = avg
+    else:
+        size = d["size"]
+        entry = d["price"]
+        amount = (size * (1 - FEE_PCT / 100)) / entry
+        cost = size
+        st["paper_cash"] -= size
+    _open_position(ex, st, entry, amount, cost)
+    return True
+
+
+def dip_check(ex, st, price, cancel=False):
+    """Watch the resting dip order. Cancels and clears it when cancel=True or when it is older than DIP_REPRICE_SEC
+    (the main loop then places a fresh one under the new price). Returns True when a position was opened."""
+    d = st.get("dip_order")
+    if not d:
+        return False
+    expired = cancel or time.time() - d["ts"] >= DIP_REPRICE_SEC
+    if not LIVE:
+        if price <= d["price"]:
+            return _dip_filled(ex, st, d, None)
+        if expired:
+            st["dip_order"] = None
+            save_state(st)
+        return False
+    o = ex.fetch_order(d["id"], SYMBOL)
+    status = o.get("status")
+    if status == "closed":
+        return _dip_filled(ex, st, d, o)
+    if status not in ("canceled", "cancelled", "expired", "rejected") and expired:
+        try:
+            ex.cancel_order(d["id"], SYMBOL)
+        except Exception as e:
+            log.info(f"cancel dip order: {e!r}"[:200])
+        time.sleep(1.5)
+        o = ex.fetch_order(d["id"], SYMBOL)
+        status = "canceled"
+    if status in ("canceled", "cancelled", "expired", "rejected"):
+        if float(o.get("filled") or 0) > 0:                                  # part of it filled before the cancel
+            return _dip_filled(ex, st, d, o)
+        st["dip_order"] = None
+        save_state(st)
+    return False
+
+
+def arena_buy_dip(st):
+    p = st["position"]
+    reason = (f"Dip rule: resting buy limit {DIP_OFFSET_PCT:g}% below the market filled at {p['entry']:.6g}. "
+              f"Size {p['cost']:.2f} USDT. Target +{TARGET_PROFIT_USD:g} USDT net at {p['tp_price']:.6g} "
+              f"({tp_pct(p):.2f}%), stop at {p['sl_price']:.6g} (-{sl_pct(p):.2f}%, about -{MAX_LOSS_USD:g} USDT).")
+    arena.add_case(SYMBOL, "BUY", 60, reason, None, "APPROVE",
+                   "Rule-based dip buy, no AI veto on this coin", p["entry"], p["cost"])
+
+
 def record_sell(st, pos, proceeds, reason):
     """Books a finished trade (proceeds = USDT received after the sell fee)."""
     proceeds += pos.get("banked", 0.0)       # part of the target order that already filled before an early exit
@@ -453,6 +587,10 @@ def publish(st, price, force=False):
         note = f"No new buys: daily loss cap reached ({st['day_pnl']:+.2f} USDT)"
     elif time.time() < st["pause_until"]:
         note = "No new buys: short pause after consecutive losses"
+    elif ENTRY_MODE == "dip":
+        d = st.get("dip_order")
+        note = (f"Dip mode: resting buy limit for {SYMBOL} at {d['price']:.6g} ({DIP_OFFSET_PCT:g}% below the market)"
+                if d else f"Dip mode: placing a buy limit for {SYMBOL}")
     else:
         r = LAST["rsi"]
         note = (f"Watching {SYMBOL} only: RSI {r:.1f}, buys when it crosses up through {RSI_OVERSOLD}"
@@ -489,9 +627,15 @@ def main():
     log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
+    if ENTRY_MODE not in ("rsi", "dip"):
+        raise SystemExit(f"ENTRY_MODE must be rsi or dip, got {ENTRY_MODE!r}. Stopping.")
+    if ENTRY_MODE == "dip":
+        log.info(f"ENTRY MODE: dip | resting buy limit {DIP_OFFSET_PCT:g}% below the market, "
+                 f"re-priced every {DIP_REPRICE_SEC}s | RSI is not used for entries")
 
     last_status = 0
     last_pub = 0.0
+    last_skip = 0
     while True:
         snap = (bool(st["position"]), st["trades"])
         try:
@@ -537,7 +681,28 @@ def main():
                 elif time.time() < st["pause_until"]:
                     blocked = "paused after consecutive losses"
 
-                if not blocked:
+                if ENTRY_MODE == "dip":
+                    if blocked:
+                        if st.get("dip_order") and dip_check(ex, st, price, cancel=True):
+                            arena_buy_dip(st)                        # it filled while being cancelled
+                        elif time.time() - last_status > 600:
+                            last_status = time.time()
+                            log.info(f"ENTRIES BLOCKED: {blocked}")
+                    elif st.get("dip_order"):
+                        if dip_check(ex, st, price):
+                            p = st["position"]
+                            arena_buy_dip(st)
+                            log.info(f"BUY {SYMBOL} {p['entry']:.6g} size {p['cost']:.2f} | dip order filled "
+                                     f"| TARGET {p['tp_price']:.6g} (+{tp_pct(p):.2f}% = +{TARGET_PROFIT_USD:g} USDT net) "
+                                     f"| STOP {p['sl_price']:.6g} (-{sl_pct(p):.2f}%) "
+                                     f"| resting limit sell on Bitget: {'yes' if p.get('tp_order') else 'no'}")
+                        elif time.time() - last_status > 600 and st.get("dip_order"):
+                            last_status = time.time()
+                            log.info(f"STATUS {SYMBOL} price {price} | waiting for dip fill at "
+                                     f"{st['dip_order']['price']:.6g} | day pnl {st['day_pnl']:.2f}")
+                    else:
+                        dip_place(ex, st, price)
+                elif not blocked:
                     candles = get_closed_candles(ex, TIMEFRAME)
                     closes = [c[4] for c in candles]
                     rs = rsi_series(closes, RSI_PERIOD)
@@ -548,21 +713,26 @@ def main():
                     crossed_up = (prev_r is not None and cur_r is not None
                                   and prev_r <= RSI_OVERSOLD < cur_r)
                     if crossed_up and candle_ts != st["last_signal_candle"]:
-                        st["last_signal_candle"] = candle_ts
-                        save_state(st)
                         sp = spread_pct(ex)
                         if sp > MAX_SPREAD_PCT:
-                            log.info(f"RSI signal skipped: spread {sp:.3f}% too wide")
-                        elif not trend_ok(ex):
-                            log.info("RSI signal skipped: 1h trend filter says down")
-                        elif buy(ex, st, price):
-                            arena_buy(st, prev_r, cur_r, sp)
-                            p = st["position"]
-                            log.info(f"BUY {SYMBOL} {p['entry']:.6g} size {p['cost']:.2f} | RSI crossed up "
-                                     f"{RSI_OVERSOLD} ({prev_r:.1f} -> {cur_r:.1f}) | spread {sp:.3f}% "
-                                     f"| TARGET {p['tp_price']:.6g} (+{tp_pct(p):.2f}% = +{TARGET_PROFIT_USD:g} USDT net) "
-                                     f"| STOP {p['sl_price']:.6g} (-{sl_pct(p):.2f}%) "
-                                     f"| resting limit sell on Bitget: {'yes' if p.get('tp_order') else 'no'}")
+                            # spread too wide right now: do NOT use up the signal, check again in 10 s.
+                            # The cross-up stays valid until the next 15m candle closes.
+                            if time.time() - last_skip > 120:
+                                last_skip = time.time()
+                                log.info(f"RSI signal waiting: spread {sp:.3f}% too wide, retrying")
+                        else:
+                            st["last_signal_candle"] = candle_ts
+                            save_state(st)
+                            if not trend_ok(ex):
+                                log.info("RSI signal skipped: 1h trend filter says down")
+                            elif buy(ex, st, price):
+                                arena_buy(st, prev_r, cur_r, sp)
+                                p = st["position"]
+                                log.info(f"BUY {SYMBOL} {p['entry']:.6g} size {p['cost']:.2f} | RSI crossed up "
+                                         f"{RSI_OVERSOLD} ({prev_r:.1f} -> {cur_r:.1f}) | spread {sp:.3f}% "
+                                         f"| TARGET {p['tp_price']:.6g} (+{tp_pct(p):.2f}% = +{TARGET_PROFIT_USD:g} USDT net) "
+                                         f"| STOP {p['sl_price']:.6g} (-{sl_pct(p):.2f}%) "
+                                         f"| resting limit sell on Bitget: {'yes' if p.get('tp_order') else 'no'}")
                     elif time.time() - last_status > 600:
                         last_status = time.time()
                         log.info(f"STATUS {SYMBOL} price {price} RSI {cur_r:.1f} | waiting for cross-up "
