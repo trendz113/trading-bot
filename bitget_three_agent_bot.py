@@ -27,7 +27,7 @@ Environment variables (set these in Railway; same names as your old bot):
   LIMIT_WAIT_SEC=8     -> a buy limit that is not filled in this time is cancelled
   START_USDT=289       -> your balance now, only used for the equity shown on the arena page
   DAILY_LOSS_CAP=10
-  MAX_SPREAD_PCT=0.15
+  MAX_SPREAD_PCT=0.15  -> used in rsi, scan AND dip mode (dip mode waits while the spread is wider)
   TREND_FILTER=false   -> if true, buy only when 1h close > 1h EMA50
   FEE_PCT=0.1          -> per side, used for P&L math
   STATE_FILE=state.json  (point to your Railway volume path, e.g. /data/state.json)
@@ -52,6 +52,7 @@ Optional scanner mode (ENTRY_MODE=scan): the bot picks the coin itself instead o
   SCAN_SIGNAL_MAX_AGE_SEC=300 -> a signal older than this after the candle closed is dropped
 """
 import os
+import sys
 import json
 import time
 import logging
@@ -124,7 +125,8 @@ LOSS_STREAK_LIMIT = 3
 PAUSE_MINUTES = 30
 IST = timezone(timedelta(hours=5, minutes=30))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+# stdout, so Railway shows normal lines as info instead of [err]
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("rsi-bot")
 
 
@@ -413,6 +415,12 @@ def _open_position(ex, st, entry, amount, cost):
 def dip_place(ex, st, price):
     """Rest a limit buy DIP_OFFSET_PCT below the market and remember it. Returns True if an order is waiting."""
     limit_raw = price * (1 - DIP_OFFSET_PCT / 100)
+    sp = spread_pct(ex)                                      # wait while the spread is wider than MAX_SPREAD_PCT
+    if sp > MAX_SPREAD_PCT:
+        if time.time() - LAST.get("dip_spread_warn", 0) > 600:
+            LAST["dip_spread_warn"] = time.time()
+            log.info(f"DIP: spread {sp:.3f}% is above {MAX_SPREAD_PCT:g}%, not placing a buy yet")
+        return False
     if LIVE:
         base = SYMBOL.split("/")[0]
         bal = ex.fetch_balance()
@@ -429,7 +437,7 @@ def dip_place(ex, st, price):
         qty = float(ex.amount_to_precision(SYMBOL, size / limit))
         order = ex.create_limit_buy_order(SYMBOL, qty, limit)
         st["dip_order"] = {"id": order["id"], "price": limit, "ts": time.time(), "usdt_before": usdt_free,
-                           "base_before": float((bal.get(base) or {}).get("free") or 0)}
+                           "base_before": float((bal.get(base) or {}).get("free") or 0), "symbol": SYMBOL}
     else:
         cash = st["paper_cash"]
         size = cash if TRADE_SIZE_ALL else TRADE_SIZE_USDT
@@ -441,7 +449,7 @@ def dip_place(ex, st, price):
                 log.info(f"PAPER: not enough paper cash for a dip order ({cash:.2f})")
             return False
         limit = limit_raw
-        st["dip_order"] = {"price": limit, "ts": time.time(), "size": size}
+        st["dip_order"] = {"price": limit, "ts": time.time(), "size": size, "symbol": SYMBOL}
     save_state(st)
     log.info(f"DIP buy limit placed at {limit:.6g} ({DIP_OFFSET_PCT:g}% below {price:.6g}), waiting for the price to come down")
     return True
@@ -487,7 +495,14 @@ def dip_check(ex, st, price, cancel=False):
             st["dip_order"] = None
             save_state(st)
         return False
-    o = ex.fetch_order(d["id"], SYMBOL)
+    try:
+        o = ex.fetch_order(d["id"], SYMBOL)
+    except ccxt.OrderNotFound:                               # stale order from an old run / another coin: forget it
+        log.info("saved dip order is not on Bitget for this coin, clearing it. "
+                 "Check Bitget Open Orders for a leftover order on another coin.")
+        st["dip_order"] = None
+        save_state(st)
+        return False
     status = o.get("status")
     if status == "closed":
         return _dip_filled(ex, st, d, o)
@@ -559,13 +574,16 @@ def scan_refresh(ex):
     SCAN["bucket"], SCAN["tried"], SCAN["cands"] = bucket, set(), []
     coins = scan_universe(ex)
     SCAN["n"] = len(coins)
+    nearest = []                                              # (current RSI, coin) for the log line
     for sym, _vol in coins:                                   # already sorted by 24h volume, biggest first
         try:
-            candles = get_closed_candles(ex, TIMEFRAME, 60, sym)
+            candles = get_closed_candles(ex, TIMEFRAME, 100, sym)
             if len(candles) < RSI_PERIOD + 3:
                 continue
             rs = rsi_series([c[4] for c in candles], RSI_PERIOD)
             prev_r, cur_r = rs[-2], rs[-1]
+            if cur_r is not None:
+                nearest.append((cur_r, sym))
             if prev_r is None or cur_r is None or not (prev_r <= RSI_OVERSOLD < cur_r):
                 continue
             ts = candles[-1][0]
@@ -575,7 +593,9 @@ def scan_refresh(ex):
         except Exception as e:
             log.info(f"scan {sym}: {e!r}"[:200])
     names = ", ".join(c["sym"] for c in SCAN["cands"]) or "none"
-    log.info(f"SCAN: {SCAN['n']} coins watched, RSI cross-up signals: {names}")
+    nearest.sort()
+    low = ", ".join(f"{s.split('/')[0]} {r:.0f}" for r, s in nearest[:3]) or "n/a"
+    log.info(f"SCAN: {SCAN['n']} coins watched, RSI cross-up signals: {names} | lowest RSI now: {low}")
 
 
 def scan_pick(ex, st):
@@ -763,10 +783,10 @@ def main():
     log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
-    log.info(f"SCRIPT VERSION 2026-11-11b (scan mode added) | entry mode: {ENTRY_MODE}")
+    log.info(f"SCRIPT VERSION 2026-11-12a (dip order fix, dip spread check, nearest-RSI log) | entry mode: {ENTRY_MODE}")
     if ENTRY_MODE == "dip":
         log.info(f"ENTRY MODE: dip | resting buy limit {DIP_OFFSET_PCT:g}% below the market, "
-                 f"re-priced every {DIP_REPRICE_SEC}s | RSI is not used for entries")
+                 f"re-priced every {DIP_REPRICE_SEC}s, max spread {MAX_SPREAD_PCT:g}% | RSI is not used for entries")
     if ENTRY_MODE == "scan":
         log.info(f"ENTRY MODE: scan | top {SCAN_TOP_N} coins by 24h volume (min {SCAN_MIN_VOLUME_USDT:g} USDT, "
                  f"range >= {SCAN_MIN_RANGE_PCT:g}%, day move <= {SCAN_MAX_DAY_MOVE_PCT:g}%), "
