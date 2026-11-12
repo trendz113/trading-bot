@@ -88,6 +88,9 @@ RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "30"))
 RSI_EXIT = float(os.getenv("RSI_EXIT", "0"))                # 0 = off: trades end at the $ target or the stop-loss
 TARGET_PROFIT_USD = float(os.getenv("TARGET_PROFIT_USD", "10"))   # net profit wanted per trade, after fees
 MAX_LOSS_USD = float(os.getenv("MAX_LOSS_USD", "5"))              # stop-loss: about this much lost per trade
+# NO_STOP=true switches the stop-loss off completely (also for a position that is already open).
+# A missing MAX_LOSS_USD does NOT switch it off: it falls back to 5. MAX_LOSS_USD=0 also means no stop.
+NO_STOP = os.getenv("NO_STOP", "false").strip().lower() in ("true", "1", "yes", "on") or MAX_LOSS_USD <= 0
 _size = os.getenv("TRADE_SIZE_USDT", "ALL").strip().upper()
 TRADE_SIZE_ALL = _size == "ALL"                                    # ALL = whole free USDT balance on every trade
 TRADE_SIZE_USDT = 0.0 if TRADE_SIZE_ALL else float(_size)
@@ -783,7 +786,10 @@ def main():
     log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
-    log.info(f"SCRIPT VERSION 2026-11-12a (dip order fix, dip spread check, nearest-RSI log) | entry mode: {ENTRY_MODE}")
+    log.info(f"SCRIPT VERSION 2026-11-12b (NO_STOP switch) | entry mode: {ENTRY_MODE}")
+    stop_txt = "OFF (NO_STOP), the bot will never sell at a loss by itself" if NO_STOP \
+        else f"on, about -{MAX_LOSS_USD:g} USDT"
+    log.info(f"STOP-LOSS: {stop_txt}")
     if ENTRY_MODE == "dip":
         log.info(f"ENTRY MODE: dip | resting buy limit {DIP_OFFSET_PCT:g}% below the market, "
                  f"re-priced every {DIP_REPRICE_SEC}s, max spread {MAX_SPREAD_PCT:g}% | RSI is not used for entries")
@@ -822,7 +828,7 @@ def main():
                         pos["tp_order"] = None
                         save_state(st)
                 if pos:
-                    if price <= pos["sl_price"]:
+                    if not NO_STOP and price <= pos["sl_price"]:
                         sell(ex, st, price, f"stop_loss ({chg:.2f}%)")
                     elif not pos.get("tp_order") and price >= pos["tp_price"]:
                         sell(ex, st, price if LIVE else pos["tp_price"], f"take_profit ({chg:.2f}%)")
