@@ -101,7 +101,10 @@ DAILY_LOSS_CAP = float(os.getenv("DAILY_LOSS_CAP") or os.getenv("DAILY_MAX_LOSS_
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
 TREND_FILTER = os.getenv("TREND_FILTER", "false").lower() == "true"
 FEE_PCT = float(os.getenv("FEE_PCT", "0.1"))
-START_USDT = float(os.getenv("START_USDT", "300"))          # baseline for the equity shown on the arena page
+# START_USDT: a number, or leave it unset / AUTO in live mode to fetch the baseline from Bitget at every start
+_start = os.getenv("START_USDT", "AUTO").strip().upper()
+START_AUTO = _start in ("", "AUTO")
+START_USDT = 300.0 if START_AUTO else float(_start)         # baseline for the equity shown on the arena page
 DAILY_TARGET = float(os.getenv("DAILY_TARGET_USD", "1"))    # shown on the page only, not enforced
 DAILY_STRETCH = float(os.getenv("DAILY_STRETCH_USD", "5"))  # shown on the page only, not enforced
 PUBLISH_EVERY = int(os.getenv("PUBLISH_EVERY", "300"))      # seconds between website updates
@@ -326,6 +329,26 @@ def ensure_targets(pos):
     if "tp_price" not in pos or "sl_price" not in pos:
         pos["tp_price"], pos["sl_price"] = targets(pos["cost"], pos["amount"])
         pos.setdefault("tp_order", None)
+
+
+def account_value(ex):
+    """Real account value on Bitget spot: all USDT (free + locked in orders) plus the traded coin at the market price."""
+    bal = ex.fetch_balance()
+    usdt = float((bal.get("USDT") or {}).get("total") or 0)
+    base = SYMBOL.split("/")[0]
+    coins = float((bal.get(base) or {}).get("total") or 0)
+    return usdt + (coins * get_price(ex) if coins > 0 else 0.0)
+
+
+def auto_start(ex, st):
+    """Returns (baseline, value). The baseline is chosen so that the arena equity
+    (baseline + lifetime bot pnl + unrealised pnl) equals your real Bitget account value right now."""
+    value = account_value(ex)
+    p = st["position"]
+    unreal = 0.0
+    if p:
+        unreal = p["amount"] * get_price(ex, p.get("symbol")) * (1 - FEE_PCT / 100) - p["cost"]
+    return round(value - st["total_pnl"] - unreal, 2), value
 
 
 def buy(ex, st, price):
@@ -766,6 +789,7 @@ def publish(st, price, force=False):
 
 
 def main():
+    global START_USDT
     if ENTRY_MODE not in ("rsi", "dip", "scan"):
         raise SystemExit(f"ENTRY_MODE must be rsi, dip or scan, got {ENTRY_MODE!r}. Stopping.")
     if LIVE and not ((os.getenv("BITGET_KEY") or os.getenv("BITGET_API_KEY"))
@@ -776,17 +800,24 @@ def main():
     st = load_state()
     if ENTRY_MODE == "scan" and st["position"] and st["position"].get("symbol"):
         set_symbol(st["position"]["symbol"])                 # a restart must keep managing the coin that was bought
+    size_ref = START_USDT                                    # balance used for the "needs +x%" log line
+    if START_AUTO and LIVE:
+        try:
+            START_USDT, size_ref = auto_start(ex, st)
+            log.info(f"START_USDT fetched from Bitget: account value {size_ref:.2f}, arena baseline {START_USDT:.2f}")
+        except Exception as e:
+            log.info(f"START_USDT auto fetch failed ({e!r}), using {START_USDT:g}"[:300])
     mode = "LIVE (REAL MONEY)" if LIVE else "PAPER"
     size_txt = "WHOLE free USDT balance" if TRADE_SIZE_ALL else f"{TRADE_SIZE_USDT:g} USDT"
-    need_pct = (TARGET_PROFIT_USD / max(START_USDT, 1) + 2 * FEE_PCT / 100) * 100
+    need_pct = (TARGET_PROFIT_USD / max(size_ref, 1) + 2 * FEE_PCT / 100) * 100
     coin_txt = f"scanning top {SCAN_TOP_N} coins" if ENTRY_MODE == "scan" else f"ONLY coin: {SYMBOL}"
     log.info(f"{mode} | RSI bot | {coin_txt} | {TIMEFRAME} RSI({RSI_PERIOD}) buy on cross-up of {RSI_OVERSOLD} "
              f"| per trade: size {size_txt}, target +{TARGET_PROFIT_USD:g} USDT net, stop about -{MAX_LOSS_USD:g} USDT "
              f"| daily loss cap {DAILY_LOSS_CAP:g} | trend filter {TREND_FILTER}")
-    log.info(f"On {START_USDT:g} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
+    log.info(f"On {size_ref:.0f} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
-    log.info(f"SCRIPT VERSION 2026-11-12b (NO_STOP switch) | entry mode: {ENTRY_MODE}")
+    log.info(f"SCRIPT VERSION 2026-11-12c (NO_STOP switch, auto START_USDT) | entry mode: {ENTRY_MODE}")
     stop_txt = "OFF (NO_STOP), the bot will never sell at a loss by itself" if NO_STOP \
         else f"on, about -{MAX_LOSS_USD:g} USDT"
     log.info(f"STOP-LOSS: {stop_txt}")
