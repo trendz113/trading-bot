@@ -8,22 +8,60 @@ on that ONE repo only):
   GITHUB_TOKEN, GITHUB_REPO (e.g. trendz113/salarybit), GITHUB_PATH (default arena.json)
   GITHUB_BRANCH (optional: push to a separate data branch so your site history is not flooded)
   GITHUB_MIN_INTERVAL (seconds between pushes unless a trade happened, default 300)
+
+GAME UPDATE (for the new trading-arena.html):
+  - STATE["lifetime"] keeps running totals (trades, wins, losses, pnl, streaks, per-day profit)
+    so XP, levels, streaks and badges never reset when old cases roll off the board.
+  - close_trade() now stamps "closed_at" on the trade so the page can time each trade.
 """
 import os, json, base64, time, requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 FILE = os.path.join(os.getenv("DATA_DIR", "."), "arena.json")
 os.makedirs(os.path.dirname(FILE) or ".", exist_ok=True)
 KEEP = 60                       # cases kept on the page
 VETO_WINDOW_H = 4               # how long a vetoed idea is tracked for "would have" result
+IST = timezone(timedelta(hours=5, minutes=30))
+DAILY_KEEP = 45                 # days of per-day history kept in lifetime
 
-STATE = {"cases": []}
+
+def _new_lifetime():
+    return {"since": time.time(), "trades": 0, "wins": 0, "losses": 0, "pnl_usdt": 0.0,
+            "streak": 0, "best_streak": 0, "daily": {}}
+
+
+STATE = {"cases": [], "lifetime": _new_lifetime()}
 _LAST_PUSH = [0.0]
 if os.path.exists(FILE):
     try:
-        STATE = json.load(open(FILE))
+        loaded = json.load(open(FILE))
+        # arena.json is the public output, so rebuild STATE from it: cases, activity and lifetime
+        STATE["cases"] = loaded.get("cases", [])
+        STATE["activity"] = loaded.get("activity", [])
+        if isinstance(loaded.get("lifetime"), dict):
+            STATE["lifetime"].update(loaded["lifetime"])
     except Exception:
         pass
+
+
+def _record_close(pnl_usdt):
+    """Update lifetime totals for one finished trade."""
+    L = STATE["lifetime"]
+    day = datetime.now(IST).strftime("%Y-%m-%d")
+    d = L["daily"].setdefault(day, {"pnl": 0.0, "wins": 0})
+    L["trades"] += 1
+    L["pnl_usdt"] = round(L["pnl_usdt"] + pnl_usdt, 2)
+    d["pnl"] = round(d["pnl"] + pnl_usdt, 2)
+    if pnl_usdt > 0:
+        L["wins"] += 1
+        d["wins"] += 1
+        L["streak"] += 1
+        L["best_streak"] = max(L["best_streak"], L["streak"])
+    else:
+        L["losses"] += 1
+        L["streak"] = 0
+    for old in sorted(L["daily"])[:-DAILY_KEEP]:
+        del L["daily"][old]
 
 
 def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, judge_reason, price, size_usdt=None):
@@ -65,6 +103,7 @@ def reset():
         pass
     STATE["cases"] = []
     STATE["activity"] = []
+    STATE["lifetime"] = _new_lifetime()
 
 
 def add_activity(entry):
@@ -83,10 +122,12 @@ def set_note(symbol, text):
 
 def close_trade(symbol, pnl_usdt, pnl_pct, reason=""):
     """Call when a position is sold (stop-loss, take-profit, time exit, or approved early sell)."""
+    _record_close(pnl_usdt)          # lifetime totals are counted once per sale, even if no open case is found
     for c in STATE["cases"]:
         if c["symbol"] == symbol and c["outcome"]["status"] == "open":
             c["outcome"] = {"status": "closed", "pnl_pct": round(pnl_pct, 2),
-                            "pnl_usdt": round(pnl_usdt, 2), "closed_by": reason}
+                            "pnl_usdt": round(pnl_usdt, 2), "closed_by": reason,
+                            "closed_at": time.time()}
             return
 
 
@@ -99,6 +140,7 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None,
         "costs": costs,
         "cases": STATE["cases"],
         "activity": STATE.get("activity", [])[:40],
+        "lifetime": STATE["lifetime"],
     }
     if extra:
         out.update(extra)
