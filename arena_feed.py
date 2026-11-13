@@ -64,6 +64,18 @@ def _record_close(pnl_usdt):
         del L["daily"][old]
 
 
+def _retire_old_open(keep_ts=None):
+    """Any older 'open' card is a trade that was closed outside the bot (for example sold by hand).
+    Mark it 'manual' so the page never shows it as live. Manual cards are not counted in lifetime totals."""
+    opens = [c for c in STATE["cases"] if c.get("outcome", {}).get("status") == "open"]
+    if keep_ts is None and opens:
+        keep_ts = max(c["ts"] for c in opens)        # the newest open case stays live
+    for c in opens:
+        if c["ts"] != keep_ts:
+            c["outcome"] = {"status": "manual", "pnl_pct": c["outcome"].get("pnl_pct"),
+                            "closed_by": "sold outside the bot", "closed_at": time.time()}
+
+
 def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, judge_reason, price, size_usdt=None):
     """Call once per decision on a BUY idea. verdict: APPROVE or REJECT. size_usdt lets open trades show USDT P&L."""
     ok = verdict == "APPROVE"
@@ -78,6 +90,8 @@ def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, jud
                     else {"status": "vetoed", "would_have_pct": None}),
     })
     del STATE["cases"][KEEP:]
+    if ok:                                           # the bot holds one position at a time
+        _retire_old_open(keep_ts=STATE["cases"][0]["ts"])
 
 
 def update_prices(prices):
@@ -172,3 +186,6 @@ def publish(equity, start_equity, fear_greed, mood_text, paper=True, costs=None,
             print("arena: push FAILED", pr.status_code, pr.text[:200])
     except Exception as e:
         print("arena push failed:", e)
+
+
+_retire_old_open()   # tidy leftovers from earlier runs whenever this module loads
