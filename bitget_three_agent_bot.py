@@ -769,6 +769,33 @@ def reconcile_saved_position(ex, st):
         save_state(st)
 
 
+def drop_if_sold_by_hand(ex, st, pos):
+    """Live only. Called when the resting take-profit order has disappeared: if the coins of the tracked
+    position are no longer on Bitget (you sold them by hand), forget the position right away instead of
+    waiting for the next restart. Returns True when the position was cleared."""
+    if not LIVE:
+        return False
+    psym = pos.get("symbol") or SYMBOL
+    pbase = psym.split("/")[0]
+    try:
+        held = float((ex.fetch_balance().get(pbase) or {}).get("total") or 0)
+    except Exception as e:
+        log.info(f"sold-by-hand check skipped, could not read balance: {e!r}"[:300])
+        return False
+    if held < 0.95 * float(pos["amount"]):
+        log.info(f"SOLD BY HAND: tracked {psym} amount {pos['amount']:g} but Bitget holds only {held:g} {pbase}. "
+                 f"Clearing the position.")
+        st["position"] = None
+        st["dip_order"] = None
+        save_state(st)
+        try:
+            arena.retire_all_open()
+        except Exception as e:
+            log.info(f"arena cleanup error: {e!r}"[:200])
+        return True
+    return False
+
+
 def main():
     global START_USDT
     if ENTRY_MODE not in ("rsi", "dip", "scan"):
@@ -783,6 +810,11 @@ def main():
     if st["position"] and st["position"].get("symbol"):
         set_symbol(st["position"]["symbol"])
     reconcile_saved_position(ex, st)
+    if not st["position"]:
+        try:
+            arena.retire_all_open()      # website cards of trades sold by hand must not stay LIVE
+        except Exception as e:
+            log.info(f"arena cleanup error: {e!r}"[:200])
     if not st["position"] and ENTRY_MODE != "scan":
         set_symbol(CONFIG_SYMBOL)
         st["dip_order"] = None if (st.get("dip_order") or {}).get("symbol") not in (None, CONFIG_SYMBOL) \
@@ -804,7 +836,7 @@ def main():
     log.info(f"On {size_ref:.0f} USDT a +{TARGET_PROFIT_USD:g} USDT net target needs the price to rise about "
              f"{need_pct:.2f}% above the buy price (fees included)")
     log.info(f"Restored state: position={st['position']} day_pnl={st['day_pnl']:.2f}")
-    log.info(f"SCRIPT VERSION 2026-11-12d (ghost-position fix, own-symbol pricing, dust guard) | entry mode: {ENTRY_MODE}")
+    log.info(f"SCRIPT VERSION 2026-11-13a (adds sold-by-hand check while running, website cleanup) | entry mode: {ENTRY_MODE}")
     stop_txt = "OFF (NO_STOP), the bot will never sell at a loss by itself" if NO_STOP \
         else f"on, about -{MAX_LOSS_USD:g} USDT"
     log.info(f"STOP-LOSS: {stop_txt}")
@@ -856,6 +888,8 @@ def main():
                         log.info("the resting take-profit order is gone, the bot will watch the target itself")
                         pos["tp_order"] = None
                         save_state(st)
+                        if drop_if_sold_by_hand(ex, st, pos):
+                            pos = None
                 if pos:
                     if not NO_STOP and price <= pos["sl_price"]:
                         sell(ex, st, price, f"stop_loss ({chg:.2f}%)")
