@@ -76,6 +76,18 @@ def _retire_old_open(keep_ts=None):
                             "closed_by": "sold outside the bot", "closed_at": time.time()}
 
 
+def _mark_manual(c):
+    c["outcome"] = {"status": "manual", "pnl_pct": c["outcome"].get("pnl_pct"),
+                    "closed_by": "sold outside the bot", "closed_at": time.time()}
+
+
+def retire_all_open():
+    """Call when the bot knows it holds nothing (startup check, or coins sold by hand)."""
+    for c in STATE["cases"]:
+        if c.get("outcome", {}).get("status") == "open":
+            _mark_manual(c)
+
+
 def add_case(symbol, side, confidence, buyer_reason, seller_reason, verdict, judge_reason, price, size_usdt=None):
     """Call once per decision on a BUY idea. verdict: APPROVE or REJECT. size_usdt lets open trades show USDT P&L."""
     ok = verdict == "APPROVE"
@@ -136,6 +148,11 @@ def set_note(symbol, text):
 
 def close_trade(symbol, pnl_usdt, pnl_pct, reason=""):
     """Call when a position is sold (stop-loss, take-profit, time exit, or approved early sell)."""
+    if reason == "position_missing":     # the coins were already gone (sold by hand): not a bot trade, not counted
+        for c in STATE["cases"]:
+            if c["symbol"] == symbol and c["outcome"]["status"] == "open":
+                _mark_manual(c)
+        return
     _record_close(pnl_usdt)          # lifetime totals are counted once per sale, even if no open case is found
     for c in STATE["cases"]:
         if c["symbol"] == symbol and c["outcome"]["status"] == "open":
